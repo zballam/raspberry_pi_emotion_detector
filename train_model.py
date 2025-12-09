@@ -35,12 +35,23 @@ except Exception as e:
 
 DATA_CSV = "data/emotic_faces_128/labels.csv"
 BATCH_SIZE = 32
-NUM_EPOCHS = 10
-LR = 1e-3
+
+# TinyCNN: simple single-stage training
+TINYCNN_EPOCHS = 10
+TINYCNN_LR = 1e-3
+
+# Pretrained models: 2-stage training
+WARMUP_EPOCHS = 5       # classifier-only
+FINETUNE_EPOCHS = 5     # full-network fine-tune
+WARMUP_LR = 1e-3        # classifier head
+FINETUNE_LR = 1e-5      # tiny LR for whole network
+
 VAL_FRACTION = 0.2
 
 # Choose which model to train: "tinycnn", "mobilenetv2", "efficientnet_lite0"
-MODEL_NAME = "efficientnet_lite0"
+MODEL_NAME = "tinycnn"
+# MODEL_NAME = "mobilenetv2"
+# MODEL_NAME = "efficientnet_lite0"
 
 DEVICE = (
     "cuda"
@@ -53,47 +64,37 @@ print("Using device:", DEVICE)
 
 
 # ---------------------------
-# Models
+# Model builders
 # ---------------------------
 
 def build_model(model_name: str, num_classes: int) -> nn.Module:
     model_name = model_name.lower()
 
-    # -------------------------
-    # TinyCNN
-    # -------------------------
+    # Tiny CNN baseline
     if model_name == "tinycnn":
         print("Building TinyCNN")
         return TinyCNN(num_classes)
 
-    # -------------------------
     # MobileNetV2
-    # -------------------------
     if model_name == "mobilenetv2":
         if not HAS_TORCHVISION:
             raise RuntimeError("torchvision not installed; cannot use MobileNetV2.")
 
         print("Building MobileNetV2 (pretrained on ImageNet)")
-        # NOTE: expects mobilenet_v2-7ebf99e0.pth to be available in
-        # ~/.cache/torch/hub/checkpoints/ for pretrained=True to work without SSL issues.
         net = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT)
-
         in_features = net.classifier[1].in_features
         net.classifier[1] = nn.Linear(in_features, num_classes)
         return net
 
-    # -------------------------
-    # EfficientNet-Lite0 (timm)
-    # -------------------------
+    # EfficientNet-Lite0 via timm
     if model_name == "efficientnet_lite0":
         if not HAS_TIMM:
             raise RuntimeError("timm not installed; cannot use EfficientNet-Lite0.")
 
         print("Building EfficientNet-Lite0 (pretrained on ImageNet)")
-        # NOTE: expects efficientnet_lite0 weights cached in ~/.cache/timm/
         net = timm.create_model(
             "efficientnet_lite0",
-            pretrained=True,      # set to False if you don't have weights cached
+            pretrained=True,       # relies on SSL / cached weights
             num_classes=num_classes,
         )
         return net
@@ -102,7 +103,7 @@ def build_model(model_name: str, num_classes: int) -> nn.Module:
 
 
 # ---------------------------
-# Training / evaluation
+# Training / evaluation helpers
 # ---------------------------
 
 def train_one_epoch(model, loader, criterion, optimizer, device):
@@ -122,7 +123,6 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         optimizer.step()
 
         running_loss += loss.item() * imgs.size(0)
-
         _, preds = torch.max(outputs, dim=1)
         correct += (preds == labels).sum().item()
         total += labels.size(0)
@@ -147,7 +147,6 @@ def eval_one_epoch(model, loader, criterion, device):
             loss = criterion(outputs, labels)
 
             running_loss += loss.item() * imgs.size(0)
-
             _, preds = torch.max(outputs, dim=1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
@@ -155,6 +154,31 @@ def eval_one_epoch(model, loader, criterion, device):
     avg_loss = running_loss / total
     acc = correct / total
     return avg_loss, acc
+
+
+# ---------------------------
+# Freezing helpers for pretrained models
+# ---------------------------
+
+def freeze_backbone_and_unfreeze_classifier(model, model_name: str):
+    """Freeze all params, then unfreeze classifier only."""
+    for p in model.parameters():
+        p.requires_grad = False
+
+    if model_name == "mobilenetv2":
+        # mobilenet.classifier is a Sequential
+        for p in model.classifier.parameters():
+            p.requires_grad = True
+    elif model_name == "efficientnet_lite0":
+        # timm EfficientNet-Lite0 has a .classifier layer
+        for p in model.classifier.parameters():
+            p.requires_grad = True
+    else:
+        raise ValueError(f"freeze_backbone_and_unfreeze_classifier not defined for {model_name}")
+
+    # Return only trainable params for optimizer
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    return trainable_params
 
 
 # ---------------------------
@@ -171,7 +195,6 @@ def main():
     n_val = int(VAL_FRACTION * n_total)
     n_train = n_total - n_val
 
-    # Fix seed for reproducibility
     torch.manual_seed(0)
     random.seed(0)
 
@@ -180,17 +203,15 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
-    # Quick sanity check batch
+    # Sanity check
     imgs, labels = next(iter(train_loader))
     print("Batch shape:", imgs.shape, labels.shape)
 
-    # 2) Model, loss, optimizer
+    # 2) Build model
     model = build_model(MODEL_NAME, num_classes).to(DEVICE)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=LR)
 
-    # 3) Prep directories + history
-    best_val_acc = 0.0
+    # 3) Prep dirs + history
     save_dir = Path("models")
     save_dir.mkdir(exist_ok=True)
 
@@ -199,55 +220,172 @@ def main():
 
     history = {
         "epoch": [],
+        "phase": [],        # "warmup", "finetune", or "single"
         "train_loss": [],
         "train_acc": [],
         "val_loss": [],
         "val_acc": [],
     }
 
-    # 4) Train loop
-    for epoch in range(1, NUM_EPOCHS + 1):
-        train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, DEVICE
-        )
-        val_loss, val_acc = eval_one_epoch(model, val_loader, criterion, DEVICE)
+    best_val_acc = 0.0
+    global_epoch = 0
 
-        print(
-            f"Epoch {epoch:02d} | "
-            f"Train loss: {train_loss:.4f}, acc: {train_acc:.3f} | "
-            f"Val loss: {val_loss:.4f}, acc: {val_acc:.3f}"
-        )
+    # ---------------------------------------------------
+    # Case 1: TinyCNN — single-stage training
+    # ---------------------------------------------------
+    if MODEL_NAME == "tinycnn":
+        optimizer = optim.Adam(model.parameters(), lr=TINYCNN_LR)
 
-        # log history
-        history["epoch"].append(epoch)
-        history["train_loss"].append(train_loss)
-        history["train_acc"].append(train_acc)
-        history["val_loss"].append(val_loss)
-        history["val_acc"].append(val_acc)
-
-        # Save best checkpoint
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            ckpt_path = save_dir / f"emotion_{MODEL_NAME}_best.pt"
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "num_classes": num_classes,
-                    "label_to_idx": full_dataset.label_to_idx,
-                    "model_name": MODEL_NAME,
-                },
-                ckpt_path,
+        for epoch in range(1, TINYCNN_EPOCHS + 1):
+            global_epoch += 1
+            train_loss, train_acc = train_one_epoch(
+                model, train_loader, criterion, optimizer, DEVICE
             )
-            print(f"  ✅ New best model saved to {ckpt_path} (val acc={val_acc:.3f})")
+            val_loss, val_acc = eval_one_epoch(
+                model, val_loader, criterion, DEVICE
+            )
 
-    # 5) Save training history for plotting
+            print(
+                f"[tinycnn] Epoch {epoch:02d}/{TINYCNN_EPOCHS} | "
+                f"Train loss: {train_loss:.4f}, acc: {train_acc:.3f} | "
+                f"Val loss: {val_loss:.4f}, acc: {val_acc:.3f}"
+            )
+
+            history["epoch"].append(global_epoch)
+            history["phase"].append("single")
+            history["train_loss"].append(train_loss)
+            history["train_acc"].append(train_acc)
+            history["val_loss"].append(val_loss)
+            history["val_acc"].append(val_acc)
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                ckpt_path = save_dir / f"emotion_{MODEL_NAME}_best.pt"
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "num_classes": num_classes,
+                        "label_to_idx": full_dataset.label_to_idx,
+                        "model_name": MODEL_NAME,
+                    },
+                    ckpt_path,
+                )
+                print(f"  ✅ New best model saved to {ckpt_path} (val acc={val_acc:.3f})")
+
+    # ---------------------------------------------------
+    # Case 2: Pretrained models — 2-stage training
+    # ---------------------------------------------------
+    else:
+        # ---------- Stage 1: freeze backbone, train classifier ----------
+        print("=== Stage 1: classifier warmup (frozen backbone) ===")
+        trainable_params = freeze_backbone_and_unfreeze_classifier(model, MODEL_NAME)
+        optimizer = optim.Adam(trainable_params, lr=WARMUP_LR)
+
+        for epoch in range(1, WARMUP_EPOCHS + 1):
+            global_epoch += 1
+            train_loss, train_acc = train_one_epoch(
+                model, train_loader, criterion, optimizer, DEVICE
+            )
+            val_loss, val_acc = eval_one_epoch(
+                model, val_loader, criterion, DEVICE
+            )
+
+            print(
+                f"[{MODEL_NAME} warmup] Epoch {epoch:02d}/{WARMUP_EPOCHS} | "
+                f"Train loss: {train_loss:.4f}, acc: {train_acc:.3f} | "
+                f"Val loss: {val_loss:.4f}, acc: {val_acc:.3f}"
+            )
+
+            history["epoch"].append(global_epoch)
+            history["phase"].append("warmup")
+            history["train_loss"].append(train_loss)
+            history["train_acc"].append(train_acc)
+            history["val_loss"].append(val_loss)
+            history["val_acc"].append(val_acc)
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                ckpt_path = save_dir / f"emotion_{MODEL_NAME}_best.pt"
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "num_classes": num_classes,
+                        "label_to_idx": full_dataset.label_to_idx,
+                        "model_name": MODEL_NAME,
+                    },
+                    ckpt_path,
+                )
+                print(f"  ✅ New best model saved to {ckpt_path} (val acc={val_acc:.3f})")
+
+        # ---------- Stage 2: unfreeze all, fine-tune ----------
+        print("=== Stage 2: full fine-tuning (unfrozen backbone) ===")
+        for p in model.parameters():
+            p.requires_grad = True
+
+        optimizer = optim.Adam(model.parameters(), lr=FINETUNE_LR)
+
+        for epoch in range(1, FINETUNE_EPOCHS + 1):
+            global_epoch += 1
+            train_loss, train_acc = train_one_epoch(
+                model, train_loader, criterion, optimizer, DEVICE
+            )
+            val_loss, val_acc = eval_one_epoch(
+                model, val_loader, criterion, DEVICE
+            )
+
+            print(
+                f"[{MODEL_NAME} finetune] Epoch {epoch:02d}/{FINETUNE_EPOCHS} | "
+                f"Train loss: {train_loss:.4f}, acc: {train_acc:.3f} | "
+                f"Val loss: {val_loss:.4f}, acc: {val_acc:.3f}"
+            )
+
+            history["epoch"].append(global_epoch)
+            history["phase"].append("finetune")
+            history["train_loss"].append(train_loss)
+            history["train_acc"].append(train_acc)
+            history["val_loss"].append(val_loss)
+            history["val_acc"].append(val_acc)
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                ckpt_path = save_dir / f"emotion_{MODEL_NAME}_best.pt"
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "num_classes": num_classes,
+                        "label_to_idx": full_dataset.label_to_idx,
+                        "model_name": MODEL_NAME,
+                    },
+                    ckpt_path,
+                )
+                print(f"  ✅ New best model saved to {ckpt_path} (val acc={val_acc:.3f})")
+
+    # 4) Save history for plotting
     history_df = pd.DataFrame(history)
     history_path = logs_dir / f"history_{MODEL_NAME}.csv"
     history_df.to_csv(history_path, index=False)
     print(f"Saved training history to {history_path}")
-
     print("Training complete. Best val acc:", best_val_acc)
 
 
 if __name__ == "__main__":
-    main()
+
+    # List of models you want to train
+    MODELS_TO_TRAIN = [
+        "tinycnn",
+        "mobilenetv2",
+        "efficientnet_lite0",
+    ]
+
+    for MODEL_NAME in MODELS_TO_TRAIN:
+        print("\n" + "=" * 80)
+        print(f" Training model: {MODEL_NAME}")
+        print("=" * 80 + "\n")
+
+        try:
+            main()  # ← runs the full training loop with the current MODEL_NAME
+        except Exception as e:
+            print(f" Error while training {MODEL_NAME}: {e}")
+            continue
+
+    print("\n🎉 All requested models have finished training!")
