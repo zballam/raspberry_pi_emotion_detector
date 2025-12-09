@@ -7,16 +7,26 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
+import pandas as pd
 
 from utility.face_dataloader import EmoticFaceDataset
-from utility.tinycnn import TinyCNN  # <--- TinyCNN imported here
+from utility.tinycnn import TinyCNN
 
-# Optional: MobileNetV2 (need torchvision installed)
+# Optional: MobileNetV2 (needs torchvision)
 try:
     from torchvision import models
     HAS_TORCHVISION = True
-except ImportError:
+except Exception as e:
+    print("Error importing torchvision:", repr(e))
     HAS_TORCHVISION = False
+
+# Optional: EfficientNet-Lite (via timm)
+try:
+    import timm
+    HAS_TIMM = True
+except Exception as e:
+    print("Error importing timm:", repr(e))
+    HAS_TIMM = False
 
 
 # ---------------------------
@@ -29,11 +39,16 @@ NUM_EPOCHS = 10
 LR = 1e-3
 VAL_FRACTION = 0.2
 
-# Choose which model to train: "tinycnn" or "mobilenetv2"
-MODEL_NAME = "tinycnn"   # change to "mobilenetv2" for the other run
+# Choose which model to train: "tinycnn", "mobilenetv2", "efficientnet_lite0"
+MODEL_NAME = "efficientnet_lite0"
 
-DEVICE = "cuda" if torch.cuda.is_available() else \
-         "mps" if torch.backends.mps.is_available() else "cpu"
+DEVICE = (
+    "cuda"
+    if torch.cuda.is_available()
+    else "mps"
+    if torch.backends.mps.is_available()
+    else "cpu"
+)
 print("Using device:", DEVICE)
 
 
@@ -44,18 +59,43 @@ print("Using device:", DEVICE)
 def build_model(model_name: str, num_classes: int) -> nn.Module:
     model_name = model_name.lower()
 
+    # -------------------------
+    # TinyCNN
+    # -------------------------
     if model_name == "tinycnn":
         print("Building TinyCNN")
         return TinyCNN(num_classes)
 
+    # -------------------------
+    # MobileNetV2
+    # -------------------------
     if model_name == "mobilenetv2":
         if not HAS_TORCHVISION:
             raise RuntimeError("torchvision not installed; cannot use MobileNetV2.")
+
         print("Building MobileNetV2 (pretrained on ImageNet)")
+        # NOTE: expects mobilenet_v2-7ebf99e0.pth to be available in
+        # ~/.cache/torch/hub/checkpoints/ for pretrained=True to work without SSL issues.
         net = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT)
-        # Replace classifier head
+
         in_features = net.classifier[1].in_features
         net.classifier[1] = nn.Linear(in_features, num_classes)
+        return net
+
+    # -------------------------
+    # EfficientNet-Lite0 (timm)
+    # -------------------------
+    if model_name == "efficientnet_lite0":
+        if not HAS_TIMM:
+            raise RuntimeError("timm not installed; cannot use EfficientNet-Lite0.")
+
+        print("Building EfficientNet-Lite0 (pretrained on ImageNet)")
+        # NOTE: expects efficientnet_lite0 weights cached in ~/.cache/timm/
+        net = timm.create_model(
+            "efficientnet_lite0",
+            pretrained=True,      # set to False if you don't have weights cached
+            num_classes=num_classes,
+        )
         return net
 
     raise ValueError(f"Unknown model_name: {model_name}")
@@ -167,7 +207,9 @@ def main():
 
     # 4) Train loop
     for epoch in range(1, NUM_EPOCHS + 1):
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, DEVICE)
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, criterion, optimizer, DEVICE
+        )
         val_loss, val_acc = eval_one_epoch(model, val_loader, criterion, DEVICE)
 
         print(
@@ -199,8 +241,6 @@ def main():
             print(f"  ✅ New best model saved to {ckpt_path} (val acc={val_acc:.3f})")
 
     # 5) Save training history for plotting
-    import pandas as pd
-
     history_df = pd.DataFrame(history)
     history_path = logs_dir / f"history_{MODEL_NAME}.csv"
     history_df.to_csv(history_path, index=False)
