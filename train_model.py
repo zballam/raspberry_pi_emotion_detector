@@ -3,11 +3,13 @@
 from pathlib import Path
 import copy
 import csv
+import time
+import subprocess  # ← NEW: for GPU stats via nvidia-smi
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset, WeightedRandomSampler  # ← NEW: WeightedRandomSampler
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from torchvision import models, transforms
 
 # efficientnet_lite0 from timm
@@ -18,7 +20,7 @@ except ImportError:
 
 # 🔹 Your existing code
 from utility.face_dataloader import EmoticFaceDataset
-from utility.tinycnn import TinyCNN   # ← USE YOUR IMPLEMENTATION
+from utility.tinycnn import TinyCNN   # ← YOUR IMPLEMENTATION
 
 
 # =====================================================
@@ -31,8 +33,40 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
 else:
     device = torch.device("cpu")
 
-if __name__ == "__main__":
-    print("Using device:", device)
+print("Using device:", device)
+if device.type == "cuda":
+    try:
+        print("CUDA device:", torch.cuda.get_device_name(0))
+    except Exception:
+        pass
+
+
+# =====================================================
+# Helper: log GPU stats (CUDA only)
+# =====================================================
+def log_gpu_stats():
+    """Print basic GPU util + memory stats if on CUDA and nvidia-smi is available."""
+    if device.type != "cuda":
+        return
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        # Expect a single line like: "23, 1024, 24576"
+        line = result.stdout.strip().splitlines()[0]
+        util_str, mem_used_str, mem_total_str = [p.strip() for p in line.split(",")]
+        print(
+            f"[CUDA] GPU util: {util_str}% | Mem: {mem_used_str} / {mem_total_str} MiB"
+        )
+    except Exception as e:
+        print(f"[CUDA] Could not query nvidia-smi: {e}")
 
 
 # =====================================================
@@ -60,9 +94,7 @@ def get_transforms(model_name: str, is_train: bool):
             ),
         ]
 
-    ops += [
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)
-    ]
+    ops += [transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)]
 
     return transforms.Compose(ops)
 
@@ -71,7 +103,7 @@ def get_transforms(model_name: str, is_train: bool):
 # Model builders
 # =====================================================
 def build_tinycnn(num_classes: int):
-    model = TinyCNN(num_classes=num_classes)  # ← YOUR TinyCNN
+    model = TinyCNN(num_classes=num_classes)
     params = model.parameters()
     return model, params
 
@@ -121,20 +153,45 @@ def build_model(model_name: str, num_classes: int):
 # =====================================================
 # ONE-CSV dataloader (labels_coarse.csv)
 #  + class weights + weighted sampler
+#  + device-dependent batch_size / workers
 # =====================================================
 def make_dataloaders_single_csv(
     model_name: str,
     csv_path: str,
     label_column="coarse_label",
-    batch_size=64,
+    batch_size=None,
     val_frac=0.2,
-    seed=42
+    seed=42,
 ):
     """
     Random split from ONE CSV.
+
+    If batch_size is None:
+      - MPS/CPU: batch_size = 64, num_workers = 4
+      - CUDA:    batch_size = 256, num_workers = 8, persistent_workers=True
+
     Returns:
         train_loader, val_loader, num_classes, class_weights (tensor [num_classes])
     """
+    # Device-specific defaults
+    if batch_size is None:
+        if device.type == "cuda":
+            batch_size = 256
+        else:
+            batch_size = 64
+
+    if device.type == "cuda":
+        num_workers = 8
+        persistent_workers = True
+    else:
+        num_workers = 4
+        persistent_workers = False
+
+    print(
+        f"[make_dataloaders_single_csv] Using batch_size={batch_size}, "
+        f"num_workers={num_workers}, persistent_workers={persistent_workers}"
+    )
+
     # Base dataset (no transforms) just to access labels & mapping
     base = EmoticFaceDataset(csv_path, label_column, transform=None)
     num_samples = len(base)
@@ -151,7 +208,6 @@ def make_dataloaders_single_csv(
     # -------------------------------------------------
     # Compute class counts from TRAIN split only
     # -------------------------------------------------
-    # Map each train index to its label index (no image loading)
     train_label_indices = []
     for i in train_idx.tolist():
         row = base.df.iloc[i]
@@ -197,23 +253,25 @@ def make_dataloaders_single_csv(
         train_ds,
         batch_size=batch_size,
         sampler=train_sampler,
-        num_workers=4,
+        num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=persistent_workers,
     )
 
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=persistent_workers,
     )
 
     return train_loader, val_loader, num_classes, class_weights
 
 
 # =====================================================
-# Training loop (now supports class_weights)
+# Training loop (supports class_weights + timing + GPU stats)
 # =====================================================
 def train_model(
     model_name,
@@ -225,7 +283,7 @@ def train_model(
     lr=1e-4,
     patience=5,
     save_path=None,
-    class_weights: torch.Tensor | None = None,  # ← NEW
+    class_weights: torch.Tensor | None = None,
 ):
     model = model.to(device)
 
@@ -248,16 +306,21 @@ def train_model(
 
     history = {k: [] for k in ["train_loss", "val_loss", "train_acc", "val_acc"]}
 
+    total_start = time.time()
+
     for epoch in range(1, num_epochs + 1):
+        epoch_start = time.time()
+
         # -------- Train --------
         model.train()
         total, correct = 0, 0
         running_loss = 0.0
 
         for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
-            optimizer.zero_grad()
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
 
+            optimizer.zero_grad()
             out = model(x)
             loss = criterion(out, y)
             loss.backward()
@@ -277,7 +340,8 @@ def train_model(
 
         with torch.no_grad():
             for x, y in val_loader:
-                x, y = x.to(device), y.to(device)
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
 
                 out = model(x)
                 loss = criterion(out, y)
@@ -295,11 +359,17 @@ def train_model(
         history["train_acc"].append(train_acc)
         history["val_acc"].append(val_acc)
 
+        epoch_time = time.time() - epoch_start
+
         print(
             f"[{model_name}] Epoch {epoch:02d} "
             f"Train {train_loss:.3f}/{train_acc:.3f} | "
-            f"Val {val_loss:.3f}/{val_acc:.3f}"
+            f"Val {val_loss:.3f}/{val_acc:.3f} | "
+            f"{epoch_time:.2f}s"
         )
+
+        # 🔹 GPU usage stats (CUDA only)
+        log_gpu_stats()
 
         scheduler.step(val_loss)
 
@@ -313,6 +383,9 @@ def train_model(
             if no_improve >= patience:
                 print(f"[{model_name}] Early stopping at epoch {epoch}")
                 break
+
+    total_time = time.time() - total_start
+    print(f"[{model_name}] Total training time: {total_time:.2f}s")
 
     # Load best weights
     model.load_state_dict(best_state)
@@ -330,7 +403,7 @@ def train_model(
 # =====================================================
 def run_experiment(model_name, csv_path):
     train_loader, val_loader, num_classes, class_weights = make_dataloaders_single_csv(
-        model_name, csv_path
+        model_name, csv_path, batch_size=None  # ← device-dependent inside
     )
 
     model, params = build_model(model_name, num_classes)
@@ -348,7 +421,7 @@ def run_experiment(model_name, csv_path):
         lr=lr,
         patience=5,
         save_path=save_path,
-        class_weights=class_weights,  # ← NEW
+        class_weights=class_weights,
     )
 
     # Save training history
@@ -379,6 +452,6 @@ def run_experiment(model_name, csv_path):
 if __name__ == "__main__":
     CSV_PATH = "data/emotic_faces_128/labels_coarse.csv"
 
-    for name in ["tinycnn"]:  # , "mobilenetv2", "efficientnet_lite0"]:
+    for name in ["tinycnn"]:
         print(f"\n=== Training {name} ===")
         run_experiment(name, CSV_PATH)
