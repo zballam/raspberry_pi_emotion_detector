@@ -1,6 +1,7 @@
 # train_model.py
 
 import random
+from collections import Counter
 from pathlib import Path
 
 import torch
@@ -33,7 +34,9 @@ except Exception as e:
 # Config
 # ---------------------------
 
-DATA_CSV = "data/emotic_faces_128/labels.csv"
+# 👉 Use the coarse 6-way labels
+DATA_CSV = "data/emotic_faces_128/labels_coarse.csv"
+
 BATCH_SIZE = 32
 
 # TinyCNN: simple single-stage training
@@ -48,10 +51,8 @@ FINETUNE_LR = 1e-5      # tiny LR for whole network
 
 VAL_FRACTION = 0.2
 
-# Choose which model to train: "tinycnn", "mobilenetv2", "efficientnet_lite0"
+# Choose which model to train: will be overridden by the loop at bottom
 MODEL_NAME = "tinycnn"
-# MODEL_NAME = "mobilenetv2"
-# MODEL_NAME = "efficientnet_lite0"
 
 DEVICE = (
     "cuda"
@@ -94,7 +95,7 @@ def build_model(model_name: str, num_classes: int) -> nn.Module:
         print("Building EfficientNet-Lite0 (pretrained on ImageNet)")
         net = timm.create_model(
             "efficientnet_lite0",
-            pretrained=True,       # relies on SSL / cached weights
+            pretrained=True,
             num_classes=num_classes,
         )
         return net
@@ -186,10 +187,17 @@ def freeze_backbone_and_unfreeze_classifier(model, model_name: str):
 # ---------------------------
 
 def main():
-    # 1) Dataset + splits
-    full_dataset = EmoticFaceDataset(DATA_CSV)
+    global MODEL_NAME
+
+    # 1) Dataset + splits (use coarse_label as target)
+    full_dataset = EmoticFaceDataset(
+        csv_path=DATA_CSV,
+        label_column="coarse_label",
+        transform=None,         # you can plug in augmentations later
+    )
     num_classes = len(full_dataset.label_to_idx)
     print("Num classes:", num_classes)
+    print("Label mapping:", full_dataset.label_to_idx)
 
     n_total = len(full_dataset)
     n_val = int(VAL_FRACTION * n_total)
@@ -207,11 +215,29 @@ def main():
     imgs, labels = next(iter(train_loader))
     print("Batch shape:", imgs.shape, labels.shape)
 
-    # 2) Build model
-    model = build_model(MODEL_NAME, num_classes).to(DEVICE)
-    criterion = nn.CrossEntropyLoss()
+    # 2) Class weights for imbalance (computed from train_ds)
+    label_counts = Counter()
+    for _, lbl in train_ds:
+        label_counts[int(lbl)] += 1
 
-    # 3) Prep dirs + history
+    print("Train label counts (by index):", label_counts)
+
+    class_weights = torch.zeros(num_classes, dtype=torch.float32)
+    for idx in range(num_classes):
+        count = label_counts.get(idx, 1)
+        class_weights[idx] = 1.0 / count
+
+    # Normalize weights so they don't explode
+    class_weights = class_weights * (num_classes / class_weights.sum())
+    class_weights = class_weights.to(DEVICE)
+
+    print("Class weights (in loss):", class_weights.tolist())
+
+    # 3) Build model
+    model = build_model(MODEL_NAME, num_classes).to(DEVICE)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+    # 4) Prep dirs + history
     save_dir = Path("models")
     save_dir.mkdir(exist_ok=True)
 
@@ -360,7 +386,7 @@ def main():
                 )
                 print(f"  ✅ New best model saved to {ckpt_path} (val acc={val_acc:.3f})")
 
-    # 4) Save history for plotting
+    # 5) Save history for plotting
     history_df = pd.DataFrame(history)
     history_path = logs_dir / f"history_{MODEL_NAME}.csv"
     history_df.to_csv(history_path, index=False)
@@ -383,7 +409,7 @@ if __name__ == "__main__":
         print("=" * 80 + "\n")
 
         try:
-            main()  # ← runs the full training loop with the current MODEL_NAME
+            main()  # runs the full training loop with the current MODEL_NAME
         except Exception as e:
             print(f" Error while training {MODEL_NAME}: {e}")
             continue
