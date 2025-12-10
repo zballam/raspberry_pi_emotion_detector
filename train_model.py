@@ -112,7 +112,7 @@ def build_model(model_name: str, num_classes: int):
 
 # =====================================================
 # ONE-CSV dataloader (labels_coarse.csv)
-#  + class weights + weighted sampler
+#  + balanced sampler (NO class-weighted loss)
 # =====================================================
 def make_dataloaders_single_csv(
     model_name: str,
@@ -125,7 +125,7 @@ def make_dataloaders_single_csv(
     """
     Random split from ONE CSV.
     Returns:
-        train_loader, val_loader, num_classes, class_weights (tensor [num_classes])
+        train_loader, val_loader, num_classes, class_weights (None here)
     """
     # Base dataset (no transforms) just to access labels & mapping
     base = EmoticFaceDataset(csv_path, label_column, transform=None)
@@ -152,12 +152,14 @@ def make_dataloaders_single_csv(
 
     train_label_indices = torch.tensor(train_label_indices, dtype=torch.long)
     class_counts = torch.bincount(train_label_indices, minlength=num_classes).float()
-
     class_counts[class_counts == 0] = 1.0  # safety
 
-    # Inverse-frequency weights
-    class_weights = 1.0 / class_counts
-    class_weights = class_weights / class_weights.sum()
+    print("[make_dataloaders_single_csv] Class counts:", class_counts.tolist())
+
+    # Inverse-frequency style weights for the sampler ONLY (normalize for stability)
+    inv_freq = 1.0 / class_counts
+    inv_freq = inv_freq / inv_freq.mean()
+    print("[make_dataloaders_single_csv] Sampler weights (inv_freq):", inv_freq.tolist())
 
     # -------------------------------------------------
     # Device-dependent loader settings
@@ -181,13 +183,10 @@ def make_dataloaders_single_csv(
     print(f"[make_dataloaders_single_csv] Using batch_size={batch_size}, "
           f"num_workers={num_workers}, persistent_workers={persistent_workers}")
 
-    print("[make_dataloaders_single_csv] Class counts:", class_counts.tolist())
-    print("[make_dataloaders_single_csv] Class weights:", class_weights.tolist())
-
     # -------------------------------------------------
     # WeightedRandomSampler for the TRAIN loader
     # -------------------------------------------------
-    sample_weights = class_weights[train_label_indices]
+    sample_weights = inv_freq[train_label_indices]
     train_sampler = WeightedRandomSampler(
         weights=sample_weights,
         num_samples=len(sample_weights),
@@ -241,11 +240,12 @@ def make_dataloaders_single_csv(
             pin_memory=(device.type == "cuda"),
         )
 
-    return train_loader, val_loader, num_classes, class_weights
+    # IMPORTANT: we now return class_weights=None so that the loss is unweighted
+    return train_loader, val_loader, num_classes, None
 
 
 # =====================================================
-# Training loop (with class_weights + warmup + timing)
+# Training loop (with optional class_weights + warmup + timing)
 # =====================================================
 def _cuda_stats():
     """Helper to grab simple GPU stats via nvidia-smi, if available."""
@@ -286,12 +286,13 @@ def train_model(
 ):
     model = model.to(device)
 
-    # Use class-weighted loss if provided
+    # Use class-weighted loss if provided (currently None from make_dataloaders)
     if class_weights is not None:
         class_weights = class_weights.to(device)
         print(f"[{model_name}] Using class-weighted CrossEntropyLoss")
         criterion = nn.CrossEntropyLoss(weight=class_weights)
     else:
+        print(f"[{model_name}] Using standard CrossEntropyLoss (no class weights)")
         criterion = nn.CrossEntropyLoss()
 
     optimizer = optim.Adam(params_to_optimize, lr=lr)
@@ -315,7 +316,6 @@ def train_model(
         print(f"[{model_name}] Warmup: running one batch to initialize "
               f"dataloader workers & CUDA/cuDNN...")
 
-        # Make sure nothing is in-flight before timing
         torch.cuda.synchronize()
         t0 = time.time()
 
@@ -327,7 +327,6 @@ def train_model(
                 _ = criterion(out, y)
                 break
 
-        # Make sure the warmup work is fully finished
         torch.cuda.synchronize()
         warmup_time = time.time() - t0
 
@@ -338,7 +337,6 @@ def train_model(
     # Epoch loop (steady-state timing)
     # -------------------------------------------------
     for epoch in range(1, num_epochs + 1):
-        # Sync before timing epoch on CUDA
         if device.type == "cuda":
             torch.cuda.synchronize()
         epoch_start = time.time()
@@ -383,12 +381,10 @@ def train_model(
         val_loss = running_loss / total
         val_acc = correct / total
 
-        # Sync again so epoch_time includes all GPU work
         if device.type == "cuda":
             torch.cuda.synchronize()
         epoch_time = time.time() - epoch_start
 
-        # Log
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["train_acc"].append(train_acc)
@@ -400,7 +396,6 @@ def train_model(
                f"{epoch_time:.2f}s")
         print(msg)
 
-        # Optional: GPU stats
         stats = _cuda_stats()
         if stats is not None:
             util, mem_used, mem_total = stats
@@ -419,7 +414,6 @@ def train_model(
                 print(f"[{model_name}] Early stopping at epoch {epoch}")
                 break
 
-    # Final sync before total timing on CUDA
     if device.type == "cuda":
         torch.cuda.synchronize()
     total_time = time.time() - total_start
@@ -430,7 +424,6 @@ def train_model(
         print(f"[{model_name}]   └─ Time inside epoch loop: "
               f"{total_time - warmup_time:.2f}s")
 
-    # Load best weights
     model.load_state_dict(best_state)
 
     if save_path:
@@ -475,7 +468,7 @@ def run_experiment(model_name, csv_path):
         lr=lr,
         patience=5,
         save_path=save_path,
-        class_weights=class_weights,
+        class_weights=class_weights,  # currently None
     )
 
     # Save training history
