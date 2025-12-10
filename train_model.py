@@ -7,7 +7,7 @@ import csv
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler  # ← NEW: WeightedRandomSampler
 from torchvision import models, transforms
 
 # efficientnet_lite0 from timm
@@ -120,6 +120,7 @@ def build_model(model_name: str, num_classes: int):
 
 # =====================================================
 # ONE-CSV dataloader (labels_coarse.csv)
+#  + class weights + weighted sampler
 # =====================================================
 def make_dataloaders_single_csv(
     model_name: str,
@@ -131,11 +132,15 @@ def make_dataloaders_single_csv(
 ):
     """
     Random split from ONE CSV.
+    Returns:
+        train_loader, val_loader, num_classes, class_weights (tensor [num_classes])
     """
+    # Base dataset (no transforms) just to access labels & mapping
     base = EmoticFaceDataset(csv_path, label_column, transform=None)
     num_samples = len(base)
     num_classes = len(base.label_to_idx)
 
+    # Random split indices
     g = torch.Generator().manual_seed(seed)
     perm = torch.randperm(num_samples, generator=g)
     n_val = int(val_frac * num_samples)
@@ -143,6 +148,41 @@ def make_dataloaders_single_csv(
     val_idx = perm[:n_val]
     train_idx = perm[n_val:]
 
+    # -------------------------------------------------
+    # Compute class counts from TRAIN split only
+    # -------------------------------------------------
+    # Map each train index to its label index (no image loading)
+    train_label_indices = []
+    for i in train_idx.tolist():
+        row = base.df.iloc[i]
+        label_name = row[label_column]
+        label_idx = base.label_to_idx[label_name]
+        train_label_indices.append(label_idx)
+
+    train_label_indices = torch.tensor(train_label_indices, dtype=torch.long)
+    class_counts = torch.bincount(train_label_indices, minlength=num_classes).float()
+
+    # Avoid division by zero just in case (shouldn't happen, but safe)
+    class_counts[class_counts == 0] = 1.0
+
+    # Inverse-frequency weights
+    class_weights = 1.0 / class_counts
+    class_weights = class_weights / class_weights.sum()
+
+    print("\n[make_dataloaders_single_csv] Class counts:", class_counts.tolist())
+    print("[make_dataloaders_single_csv] Class weights:", class_weights.tolist())
+
+    # -------------------------------------------------
+    # WeightedRandomSampler for the TRAIN loader
+    # -------------------------------------------------
+    sample_weights = class_weights[train_label_indices]  # per-example weights
+    train_sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+
+    # Transforms
     train_tf = get_transforms(model_name, True)
     val_tf = get_transforms(model_name, False)
 
@@ -152,14 +192,28 @@ def make_dataloaders_single_csv(
     train_ds = Subset(full_train, train_idx)
     val_ds = Subset(full_val, val_idx)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    # NOTE: sampler for train, NO shuffle
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        sampler=train_sampler,
+        num_workers=4,
+        pin_memory=True,
+    )
 
-    return train_loader, val_loader, num_classes
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    return train_loader, val_loader, num_classes, class_weights
 
 
 # =====================================================
-# Training loop
+# Training loop (now supports class_weights)
 # =====================================================
 def train_model(
     model_name,
@@ -171,11 +225,22 @@ def train_model(
     lr=1e-4,
     patience=5,
     save_path=None,
+    class_weights: torch.Tensor | None = None,  # ← NEW
 ):
     model = model.to(device)
-    criterion = nn.CrossEntropyLoss()
+
+    # Use class-weighted loss if provided
+    if class_weights is not None:
+        class_weights = class_weights.to(device)
+        print(f"[{model_name}] Using class-weighted CrossEntropyLoss")
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+    else:
+        criterion = nn.CrossEntropyLoss()
+
     optimizer = optim.Adam(params_to_optimize, lr=lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=2
+    )
 
     best_loss = float("inf")
     best_state = copy.deepcopy(model.state_dict())
@@ -187,7 +252,7 @@ def train_model(
         # -------- Train --------
         model.train()
         total, correct = 0, 0
-        running_loss = 0
+        running_loss = 0.0
 
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
@@ -208,7 +273,7 @@ def train_model(
         # -------- Validate --------
         model.eval()
         total, correct = 0, 0
-        running_loss = 0
+        running_loss = 0.0
 
         with torch.no_grad():
             for x, y in val_loader:
@@ -230,9 +295,11 @@ def train_model(
         history["train_acc"].append(train_acc)
         history["val_acc"].append(val_acc)
 
-        print(f"[{model_name}] Epoch {epoch:02d} "
-              f"Train {train_loss:.3f}/{train_acc:.3f} | "
-              f"Val {val_loss:.3f}/{val_acc:.3f}")
+        print(
+            f"[{model_name}] Epoch {epoch:02d} "
+            f"Train {train_loss:.3f}/{train_acc:.3f} | "
+            f"Val {val_loss:.3f}/{val_acc:.3f}"
+        )
 
         scheduler.step(val_loss)
 
@@ -262,7 +329,7 @@ def train_model(
 # Run one experiment + save CSV
 # =====================================================
 def run_experiment(model_name, csv_path):
-    train_loader, val_loader, num_classes = make_dataloaders_single_csv(
+    train_loader, val_loader, num_classes, class_weights = make_dataloaders_single_csv(
         model_name, csv_path
     )
 
@@ -281,6 +348,7 @@ def run_experiment(model_name, csv_path):
         lr=lr,
         patience=5,
         save_path=save_path,
+        class_weights=class_weights,  # ← NEW
     )
 
     # Save training history
@@ -292,13 +360,15 @@ def run_experiment(model_name, csv_path):
         writer = csv.writer(f)
         writer.writerow(["epoch", "train_loss", "val_loss", "train_acc", "val_acc"])
         for i in range(len(history["train_loss"])):
-            writer.writerow([
-                i + 1,
-                history["train_loss"][i],
-                history["val_loss"][i],
-                history["train_acc"][i],
-                history["val_acc"][i],
-            ])
+            writer.writerow(
+                [
+                    i + 1,
+                    history["train_loss"][i],
+                    history["val_loss"][i],
+                    history["train_acc"][i],
+                    history["val_acc"][i],
+                ]
+            )
 
     return model, history
 
@@ -309,6 +379,6 @@ def run_experiment(model_name, csv_path):
 if __name__ == "__main__":
     CSV_PATH = "data/emotic_faces_128/labels_coarse.csv"
 
-    for name in ["tinycnn"]: #, "mobilenetv2", "efficientnet_lite0"]:
+    for name in ["tinycnn"]:  # , "mobilenetv2", "efficientnet_lite0"]:
         print(f"\n=== Training {name} ===")
         run_experiment(name, CSV_PATH)
