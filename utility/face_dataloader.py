@@ -44,16 +44,17 @@ class EmoticFaceDataset(Dataset):
         return len(self.df)
 
     def __getitem__(self, idx):
+        if isinstance(idx, torch.Tensor):
+            idx = idx.item()
+
         row = self.df.iloc[idx]
 
         # --- Image path ---
         rel_path = Path(row["filepath"])
 
         if rel_path.is_absolute() or self.root_dir is None:
-            # Use the CSV path directly
             img_path = rel_path
         else:
-            # Prepend root_dir only if we explicitly set it
             img_path = self.root_dir / rel_path
 
         img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
