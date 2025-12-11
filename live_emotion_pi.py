@@ -7,18 +7,37 @@ from utility.model_loader import build_model, get_transforms
 
 
 # --------------------------------------------------
-# Paths
+# Paths & basic config
 # --------------------------------------------------
 ROOT = Path(__file__).resolve().parent
-CSV_PATH = ROOT / "data" / "emotic_faces_128" / "labels_coarse.csv"
-MODEL_PATH = ROOT / "models" / "emotion_tinycnn_best.pt"  # make sure this is the WEIGHTED ckpt
+MODEL_PATH = ROOT / "models" / "emotion_tinycnn_best.pt"  # make sure this file exists
+MODEL_NAME = "tinycnn"  # tinycnn for real-time on Pi
 
-MODEL_NAME = "tinycnn"          # we’re using tinycnn for real-time
-LABEL_COLUMN = "coarse_label"   # same as training
+# === Static labels: make sure order matches training ===
+label_list = [
+    "happy",
+    "surprised",
+    "neutral",
+    "confused",
+    "sad",
+    "angry",
+]
+num_classes = len(label_list)
+label_to_idx = {name: i for i, name in enumerate(label_list)}
+
+print("Num classes:", num_classes)
+print("Labels:", label_list)
+
+# Coarse groups for display
+GROUPS = {
+    "Positive": ["happy", "surprised"],
+    "Neutral": ["neutral", "confused"],
+    "Negative": ["sad", "angry"],
+}
 
 
 # --------------------------------------------------
-# Device (Pi will end up on CPU, Mac on mps)
+# Device (Pi will end up on CPU)
 # --------------------------------------------------
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -31,56 +50,27 @@ print("Using device:", device)
 
 
 # --------------------------------------------------
-# Load label mapping (reuses your dataset code)
-# --------------------------------------------------
-def load_label_mapping():
-    base_ds = EmoticFaceDataset(
-        csv_path=CSV_PATH,
-        label_column=LABEL_COLUMN,
-        transform=None,
-        root_dir=None,
-    )
-    return base_ds.idx_to_label  # {idx: label_name}
-
-
-idx_to_label = load_label_mapping()
-num_classes = len(idx_to_label)
-print("Num classes:", num_classes)
-
-# Stable list in index order
-label_list = [idx_to_label[i] for i in range(num_classes)]
-label_to_idx = {name: idx for idx, name in idx_to_label.items()}
-
-# ---- NEW: coarse emotion groups for display ----
-GROUPS = {
-    "Positive": ["happy", "surprised"],
-    "Neutral": ["neutral", "confused"],
-    "Negative": ["angry", "sad"],
-}
-
-
-# --------------------------------------------------
 # Build model + load weights
 # --------------------------------------------------
-model, _ = build_model(MODEL_NAME, num_classes)
+model = build_model(MODEL_NAME, num_classes)
 state = torch.load(MODEL_PATH, map_location=device)
 model.load_state_dict(state)
 model.to(device)
 model.eval()
 print(f"Loaded model from {MODEL_PATH}")
 
+# Transforms for inference (defined in utility/model_loader.py)
+transform = get_transforms()
+
 
 # --------------------------------------------------
-# Preprocessing (same as training, via get_transforms)
+# Preprocessing
 # --------------------------------------------------
-transform = get_transforms(MODEL_NAME, is_train=False)
-
-
 def preprocess_frame(frame_bgr: np.ndarray) -> torch.Tensor:
     """
     Take a BGR OpenCV frame (ideally a face crop), return a 1x3xHxW tensor.
     We convert to GRAYSCALE and then replicate to 3 channels, to match
-    the training pipeline which also uses grayscale-3channel input.
+    the grayscale-3channel training pipeline.
     """
     # BGR -> GRAY
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -97,7 +87,7 @@ def preprocess_frame(frame_bgr: np.ndarray) -> torch.Tensor:
     # Resize + normalize (exactly like training)
     tensor = transform(tensor)
 
-    # Add batch dimension
+    # Add batch dimension: 1,C,H,W
     return tensor.unsqueeze(0)
 
 
@@ -187,7 +177,7 @@ def main():
             logits = model(input_tensor)
             probs = torch.softmax(logits, dim=1)[0].cpu().numpy()  # [num_classes]
 
-        # ---- NEW: map 6-class probs -> 3 coarse groups ----
+        # ---- Map 6-class probs -> 3 coarse groups ----
         group_scores = {}
         for group_name, labels in GROUPS.items():
             idxs = [label_to_idx[l] for l in labels if l in label_to_idx]
@@ -198,7 +188,7 @@ def main():
 
         pred_group = max(group_scores, key=group_scores.get)
 
-        # Optional short debug print (won't spam too badly)
+        # Debug print
         print(
             f"[GROUP] Pos={group_scores['Positive']:.2f} | "
             f"Neu={group_scores['Neutral']:.2f} | "
