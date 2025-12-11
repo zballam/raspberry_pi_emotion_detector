@@ -4,7 +4,6 @@ import numpy as np
 from pathlib import Path
 
 from utility.model_loader import build_model, get_transforms
-from utility.face_dataloader import EmoticFaceDataset
 
 
 # --------------------------------------------------
