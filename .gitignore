@@ -5,8 +5,10 @@
 /emotic/mscoco/
 /emotic/emodb_small.zip
 /debug_face_128.jpg
-/data/
+data/*
+!data/emotic_faces_128/labels_coarse.csv
 # Ignore JetBrains IDE settings
 .idea/
 *.iml
 .idea
+/training_plots/
