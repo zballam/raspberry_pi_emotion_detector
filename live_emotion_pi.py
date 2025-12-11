@@ -3,7 +3,7 @@ import torch
 import numpy as np
 from pathlib import Path
 
-from train_model import build_model, get_transforms
+from utility.model_loader import build_model, get_transforms
 from utility.face_dataloader import EmoticFaceDataset
 
 
