@@ -2,12 +2,14 @@ from pathlib import Path
 import copy
 import csv
 import time
+import random
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from torchvision import models, transforms
+import matplotlib.pyplot as plt
 
 # efficientnet_lite0 from timm
 try:
@@ -111,8 +113,7 @@ def build_model(model_name: str, num_classes: int):
 
 
 # =====================================================
-# ONE-CSV dataloader (labels_coarse.csv)
-#  + stronger imbalance handling (sampler + loss)
+# ONE-CSV dataloader (labels_coarse.csv) - WEIGHTED
 # =====================================================
 def make_dataloaders_single_csv(
     model_name: str,
@@ -124,7 +125,8 @@ def make_dataloaders_single_csv(
     imbalance_gamma: float = 1.5,
 ):
     """
-    Random split from ONE CSV.
+    Random split from ONE CSV, with strong imbalance handling
+    (WeightedRandomSampler + class_weights).
     Returns:
         train_loader, val_loader, num_classes, class_weights
     """
@@ -159,8 +161,7 @@ def make_dataloaders_single_csv(
 
     print("[make_dataloaders_single_csv] Class counts:", class_counts.tolist())
 
-    # Inverse-frequency weights with a stronger exponent
-    # gamma > 1 makes minority classes relatively heavier
+    # Inverse-frequency weights with stronger exponent
     inv_freq = (1.0 / class_counts) ** imbalance_gamma
     inv_freq = inv_freq / inv_freq.mean()  # normalize around 1.0
 
@@ -262,7 +263,144 @@ def make_dataloaders_single_csv(
 
 
 # =====================================================
-# Training loop (with optional class_weights + warmup + timing)
+# Balanced dataloader (downsample train set per class)
+# =====================================================
+def make_dataloaders_balanced_single_csv(
+    model_name: str,
+    csv_path: str,
+    label_column: str = "coarse_label",
+    batch_size: int = 64,
+    val_frac: float = 0.2,
+    seed: int = 42,
+    max_per_class: int | None = None,
+):
+    """
+    Random split from ONE CSV, but then balances the TRAIN set by
+    downsampling each class to the same count (min class count or max_per_class).
+    No class weights or WeightedRandomSampler.
+    Returns:
+        train_loader, val_loader, num_classes, class_weights(None)
+    """
+    base = EmoticFaceDataset(csv_path, label_column, transform=None)
+    num_samples = len(base)
+    num_classes = len(base.label_to_idx)
+
+    g = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(num_samples, generator=g)
+    n_val = int(val_frac * num_samples)
+
+    val_idx = perm[:n_val]
+    train_idx = perm[n_val:]
+
+    # Build mapping: class_idx -> list of train indices
+    class_to_indices = {c: [] for c in range(num_classes)}
+    for i in train_idx.tolist():
+        row = base.df.iloc[i]
+        label_name = row[label_column]
+        label_idx = base.label_to_idx[label_name]
+        class_to_indices[label_idx].append(i)
+
+    # Determine per-class sample count
+    counts = {c: len(idxs) for c, idxs in class_to_indices.items()}
+    print("[make_dataloaders_balanced_single_csv] Raw train counts:", counts)
+
+    min_count = min(counts.values())
+    if max_per_class is not None:
+        n_per_class = min(min_count, max_per_class)
+    else:
+        n_per_class = min_count
+
+    print(
+        f"[make_dataloaders_balanced_single_csv] Using n_per_class={n_per_class} "
+        f"(min_count={min_count}, max_per_class={max_per_class})"
+    )
+
+    # Sample n_per_class from each class
+    rng = random.Random(seed)
+    balanced_indices = []
+    for c, idxs in class_to_indices.items():
+        if len(idxs) > n_per_class:
+            balanced_indices.extend(rng.sample(idxs, n_per_class))
+        else:
+            balanced_indices.extend(idxs)
+
+    # Shuffle balanced indices
+    rng.shuffle(balanced_indices)
+    balanced_idx = torch.tensor(balanced_indices, dtype=torch.long)
+
+    # Device-dependent loader config
+    if device.type == "cuda":
+        batch_size = 512
+        num_workers = 12
+        persistent_workers = True
+        prefetch_factor = 4
+    elif device.type == "mps":
+        batch_size = 64
+        num_workers = 4
+        persistent_workers = False
+        prefetch_factor = 2
+    else:
+        batch_size = 64
+        num_workers = 2
+        persistent_workers = False
+        prefetch_factor = 2
+
+    print(
+        f"[make_dataloaders_balanced_single_csv] Using batch_size={batch_size}, "
+        f"num_workers={num_workers}, persistent_workers={persistent_workers}"
+    )
+
+    train_tf = get_transforms(model_name, True)
+    val_tf = get_transforms(model_name, False)
+
+    full_train = EmoticFaceDataset(csv_path, label_column, transform=train_tf)
+    full_val = EmoticFaceDataset(csv_path, label_column, transform=val_tf)
+
+    train_ds = Subset(full_train, balanced_idx)
+    val_ds = Subset(full_val, val_idx)
+
+    if num_workers > 0:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=(device.type == "cuda"),
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=(device.type == "cuda"),
+        )
+
+    # No class weights for balanced training
+    class_weights = None
+    return train_loader, val_loader, num_classes, class_weights
+
+
+# =====================================================
+# Training loop
 # =====================================================
 def _cuda_stats():
     """Helper to grab simple GPU stats via nvidia-smi, if available."""
@@ -303,7 +441,7 @@ def train_model(
 ):
     model = model.to(device)
 
-    # Use class-weighted loss if provided (currently None from make_dataloaders)
+    # Use class-weighted loss if provided
     if class_weights is not None:
         class_weights = class_weights.to(device)
         print(f"[{model_name}] Using class-weighted CrossEntropyLoss")
@@ -326,7 +464,7 @@ def train_model(
     total_start = time.time()
 
     # -------------------------------------------------
-    # Warmup pass to account for CUDA & dataloader init
+    # Warmup pass (CUDA only)
     # -------------------------------------------------
     warmup_time = None
     if device.type == "cuda":
@@ -347,11 +485,10 @@ def train_model(
         torch.cuda.synchronize()
         warmup_time = time.time() - t0
 
-        print(f"[{model_name}] Warmup done in {warmup_time:.2f}s "
-              "(includes first image loads, worker startup, CUDA init).\n")
+        print(f"[{model_name}] Warmup done in {warmup_time:.2f}s\n")
 
     # -------------------------------------------------
-    # Epoch loop (steady-state timing)
+    # Epoch loop
     # -------------------------------------------------
     for epoch in range(1, num_epochs + 1):
         if device.type == "cuda":
@@ -445,6 +582,7 @@ def train_model(
 
     if save_path:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), model.state_dict())
         torch.save(model.state_dict(), save_path)
         print(f"[{model_name}] Saved best model to {save_path}")
 
@@ -454,15 +592,25 @@ def train_model(
 # =====================================================
 # Run one experiment + save CSV
 # =====================================================
-def run_experiment(model_name, csv_path):
+def run_experiment(model_name, csv_path, regime="weighted", max_per_class=None):
+    """
+    regime: "weighted" (current behavior) or "balanced"
+    """
     exp_start = time.time()
 
-    print(f"\n=== Training {model_name} ===")
+    print(f"\n=== Training {model_name} ({regime}) ===")
     print("[setup] Building dataloaders...")
     t0 = time.time()
-    train_loader, val_loader, num_classes, class_weights = make_dataloaders_single_csv(
-        model_name, csv_path
-    )
+    if regime == "weighted":
+        train_loader, val_loader, num_classes, class_weights = make_dataloaders_single_csv(
+            model_name, csv_path
+        )
+    elif regime == "balanced":
+        train_loader, val_loader, num_classes, class_weights = make_dataloaders_balanced_single_csv(
+            model_name, csv_path, max_per_class=max_per_class
+        )
+    else:
+        raise ValueError(f"Unknown regime {regime}")
     t1 = time.time()
     print(f"[setup] Dataloaders ready in {t1 - t0:.2f}s")
 
@@ -473,14 +621,14 @@ def run_experiment(model_name, csv_path):
     print(f"[setup] Model ready in {t3 - t2:.2f}s\n")
 
     lr = 1e-3 if model_name == "tinycnn" else 1e-4
-    save_path = f"models/emotion_{model_name}_best.pt"
+    save_path = f"models/emotion_{model_name}_{regime}_best.pt"
 
     model, history = train_model(
-        model_name,
-        model,
-        params,
-        train_loader,
-        val_loader,
+        model_name=f"{model_name}_{regime}",
+        model=model,
+        params_to_optimize=params,
+        train_loader=train_loader,
+        val_loader=val_loader,
         num_epochs=40,
         lr=lr,
         patience=7,
@@ -491,7 +639,7 @@ def run_experiment(model_name, csv_path):
     # Save training history
     logs = Path("logs")
     logs.mkdir(exist_ok=True)
-    hist_path = logs / f"history_{model_name}.csv"
+    hist_path = logs / f"history_{model_name}_{regime}.csv"
 
     with hist_path.open("w", newline="") as f:
         writer = csv.writer(f)
@@ -508,9 +656,34 @@ def run_experiment(model_name, csv_path):
             )
 
     exp_time = time.time() - exp_start
-    print(f"[{model_name}] Experiment finished in {exp_time:.2f}s\n")
+    print(f"[{model_name}_{regime}] Experiment finished in {exp_time:.2f}s\n")
 
     return model, history
+
+
+# =====================================================
+# Plotting helpers
+# =====================================================
+def plot_histories(all_histories, regime, metric, title_suffix=""):
+    """
+    all_histories: dict[(model_name, regime)] -> history dict
+    regime: "weighted" or "balanced"
+    metric: "train_loss", "val_loss", "train_acc", "val_acc"
+    """
+    plt.figure()
+    for model_name in ["tinycnn", "mobilenetv2", "efficientnet_lite0"]:
+        key = (model_name, regime)
+        if key not in all_histories:
+            continue
+        hist = all_histories[key]
+        y = hist[metric]
+        x = list(range(1, len(y) + 1))
+        plt.plot(x, y, label=model_name)
+    plt.xlabel("Epoch")
+    plt.ylabel(metric)
+    plt.title(f"{metric} ({regime}){title_suffix}")
+    plt.legend()
+    plt.grid(True)
 
 
 # =====================================================
@@ -526,5 +699,33 @@ if __name__ == "__main__":
 
     CSV_PATH = "data/emotic_faces_128/labels_coarse.csv"
 
-    for name in ["tinycnn"]:  # , "mobilenetv2", "efficientnet_lite0"]:
-        run_experiment(name, CSV_PATH)
+    model_names = ["tinycnn", "mobilenetv2", "efficientnet_lite0"]
+    regimes = ["weighted", "balanced"]
+
+    # You can cap per-class size for balanced if you want faster training
+    max_per_class_balanced = None  # e.g. 4000 if you want
+
+    all_histories = {}
+
+    for name in model_names:
+        # Weighted / class-weight regime (current behavior)
+        _, hist_w = run_experiment(name, CSV_PATH, regime="weighted")
+        all_histories[(name, "weighted")] = hist_w
+
+        # Balanced-dataset regime
+        _, hist_b = run_experiment(
+            name, CSV_PATH, regime="balanced", max_per_class=max_per_class_balanced
+        )
+        all_histories[(name, "balanced")] = hist_b
+
+    # --------- Plotting (8 plots total) ----------
+    # Weighted: 4 plots
+    for metric in ["train_loss", "val_loss", "train_acc", "val_acc"]:
+        plot_histories(all_histories, regime="weighted", metric=metric)
+
+    # Balanced: 4 plots
+    for metric in ["train_loss", "val_loss", "train_acc", "val_acc"]:
+        plot_histories(all_histories, regime="balanced", metric=metric)
+
+    # Show all figures
+    plt.show()

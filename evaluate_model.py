@@ -11,7 +11,7 @@ from train_model import (
 from utility.face_dataloader import EmoticFaceDataset
 
 CSV_PATH = "data/emotic_faces_128/labels_coarse.csv"
-MODEL_NAME = "efficientnet_lite0"  # or "mobilenetv2" or "tinycnn"
+MODEL_NAME = "tinycnn"  # or "mobilenetv2" or "tinycnn"
 
 device = (
     torch.device("cuda")
