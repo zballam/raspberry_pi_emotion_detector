@@ -9,3 +9,4 @@
 # Ignore JetBrains IDE settings
 .idea/
 *.iml
+.idea
