@@ -1,11 +1,4 @@
 # live_emotion_pi.py
-#
-# Live emotion detector using your existing TinyCNN pipeline.
-# - Reuses build_model + get_transforms from train_model.py
-# - Reuses EmoticFaceDataset label mapping from face_dataloader.py
-# - Uses OpenCV VideoCapture for webcam / Pi camera (if exposed as /dev/video0)
-# - NEW: Haar-cascade face detection + cropping
-# - NEW: Debug prints of per-class probabilities
 
 import cv2
 import torch

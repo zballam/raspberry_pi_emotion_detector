@@ -125,14 +125,16 @@ def make_dataloaders_single_csv(
     """
     Random split from ONE CSV.
     Returns:
-        train_loader, val_loader, num_classes, class_weights (None here)
+        train_loader, val_loader, num_classes, class_weights
     """
     # Base dataset (no transforms) just to access labels & mapping
     base = EmoticFaceDataset(csv_path, label_column, transform=None)
     num_samples = len(base)
     num_classes = len(base.label_to_idx)
 
-    # Random split indices
+    # ------------------------------
+    # Random split train / val
+    # ------------------------------
     g = torch.Generator().manual_seed(seed)
     perm = torch.randperm(num_samples, generator=g)
     n_val = int(val_frac * num_samples)
@@ -140,9 +142,9 @@ def make_dataloaders_single_csv(
     val_idx = perm[:n_val]
     train_idx = perm[n_val:]
 
-    # -------------------------------------------------
-    # Compute class counts from TRAIN split only
-    # -------------------------------------------------
+    # ------------------------------
+    # Class counts from TRAIN ONLY
+    # ------------------------------
     train_label_indices = []
     for i in train_idx.tolist():
         row = base.df.iloc[i]
@@ -152,18 +154,18 @@ def make_dataloaders_single_csv(
 
     train_label_indices = torch.tensor(train_label_indices, dtype=torch.long)
     class_counts = torch.bincount(train_label_indices, minlength=num_classes).float()
-    class_counts[class_counts == 0] = 1.0  # safety
+    class_counts[class_counts == 0] = 1.0  # safety to avoid div-by-zero
 
     print("[make_dataloaders_single_csv] Class counts:", class_counts.tolist())
 
-    # Inverse-frequency style weights for the sampler ONLY (normalize for stability)
+    # Inverse-frequency weights
     inv_freq = 1.0 / class_counts
-    inv_freq = inv_freq / inv_freq.mean()
+    inv_freq = inv_freq / inv_freq.mean()  # normalize around 1.0
     print("[make_dataloaders_single_csv] Sampler weights (inv_freq):", inv_freq.tolist())
 
-    # -------------------------------------------------
-    # Device-dependent loader settings
-    # -------------------------------------------------
+    # ------------------------------
+    # Device-dependent loader config
+    # ------------------------------
     if device.type == "cuda":
         batch_size = 512
         num_workers = 12
@@ -180,12 +182,14 @@ def make_dataloaders_single_csv(
         persistent_workers = False
         prefetch_factor = 2
 
-    print(f"[make_dataloaders_single_csv] Using batch_size={batch_size}, "
-          f"num_workers={num_workers}, persistent_workers={persistent_workers}")
+    print(
+        f"[make_dataloaders_single_csv] Using batch_size={batch_size}, "
+        f"num_workers={num_workers}, persistent_workers={persistent_workers}"
+    )
 
-    # -------------------------------------------------
-    # WeightedRandomSampler for the TRAIN loader
-    # -------------------------------------------------
+    # ------------------------------
+    # WeightedRandomSampler for TRAIN
+    # ------------------------------
     sample_weights = inv_freq[train_label_indices]
     train_sampler = WeightedRandomSampler(
         weights=sample_weights,
@@ -203,7 +207,9 @@ def make_dataloaders_single_csv(
     train_ds = Subset(full_train, train_idx)
     val_ds = Subset(full_val, val_idx)
 
-    # NOTE: sampler for train, NO shuffle
+    # ------------------------------
+    # DataLoaders
+    # ------------------------------
     if num_workers > 0:
         train_loader = DataLoader(
             train_ds,
@@ -224,7 +230,6 @@ def make_dataloaders_single_csv(
             prefetch_factor=prefetch_factor,
         )
     else:
-        # Fallback (no prefetch_factor / persistent_workers)
         train_loader = DataLoader(
             train_ds,
             batch_size=batch_size,
@@ -240,8 +245,15 @@ def make_dataloaders_single_csv(
             pin_memory=(device.type == "cuda"),
         )
 
-    # IMPORTANT: we now return class_weights=None so that the loss is unweighted
-    return train_loader, val_loader, num_classes, None
+    # ------------------------------
+    # Class weights for the LOSS
+    # ------------------------------
+    class_weights = inv_freq.clone()
+    class_weights = class_weights / class_weights.mean()
+    print("[make_dataloaders_single_csv] Loss class_weights:", class_weights.tolist())
+
+    # Now we REALLY use class_weights (not None)
+    return train_loader, val_loader, num_classes, class_weights
 
 
 # =====================================================
@@ -464,11 +476,11 @@ def run_experiment(model_name, csv_path):
         params,
         train_loader,
         val_loader,
-        num_epochs=30,
+        num_epochs=40,
         lr=lr,
-        patience=5,
+        patience=7,
         save_path=save_path,
-        class_weights=class_weights,  # currently None
+        class_weights=class_weights,
     )
 
     # Save training history
