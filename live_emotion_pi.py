@@ -1,9 +1,10 @@
-import cv2
-import torch
-import numpy as np
+import time
 from pathlib import Path
 
-from picamera2 import Picamera2   # NEW
+import cv2
+import numpy as np
+import torch
+from picamera2 import Picamera2
 
 from utility.model_loader import build_model, get_transforms
 
@@ -15,6 +16,7 @@ ROOT = Path(__file__).resolve().parent
 MODEL_PATH = ROOT / "models" / "emotion_tinycnn_best.pt"
 MODEL_NAME = "tinycnn"
 
+# === Static labels: make sure order matches training ===
 label_list = [
     "happy",
     "surprised",
@@ -69,12 +71,12 @@ def preprocess_frame(frame_bgr: np.ndarray) -> torch.Tensor:
     """
     Take a BGR OpenCV frame (ideally a face crop), return a 1x3xHxW tensor.
 
-    Here we:
+    We:
       - convert BGR -> GRAY
       - normalize to [0, 1]
-      - replicate to 3 channels (H, W, 3) as float32
-      - feed a NumPy array into torchvision transforms (which will
-        handle ToTensor/Resize/Normalize)
+      - replicate to 3 channels (H, W, 3)
+      - feed NumPy array into torchvision transforms (which will
+        handle ToTensor / Resize / Normalize)
     """
     # BGR -> GRAY
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -85,9 +87,8 @@ def preprocess_frame(frame_bgr: np.ndarray) -> torch.Tensor:
     # Replicate into 3 channels: H, W -> H, W, 3
     img = np.stack([gray, gray, gray], axis=2).astype("float32")  # HWC
 
-    # Let torchvision transforms handle ToTensor + Resize + Normalize
-    # transform(img) -> tensor (C, H, W)
-    tensor = transform(img)
+    # Let torchvision transforms handle tensor conversion + resize + normalize
+    tensor = transform(img)  # (C, H, W)
 
     # Add batch dimension: (1, C, H, W)
     return tensor.unsqueeze(0)
@@ -106,10 +107,12 @@ def _find_haar_cascade():
         except Exception:
             pass
 
-    candidates.extend([
-        Path("/usr/share/opencv4/haarcascades") / cascade_name,
-        Path("/usr/share/opencv/haarcascades") / cascade_name,
-    ])
+    candidates.extend(
+        [
+            Path("/usr/share/opencv4/haarcascades") / cascade_name,
+            Path("/usr/share/opencv/haarcascades") / cascade_name,
+        ]
+    )
 
     for p in candidates:
         if p.is_file():
@@ -135,10 +138,18 @@ except Exception as e:
 
 
 def detect_and_crop_face(frame_bgr: np.ndarray):
+    """
+    Detect the largest face in the frame and return:
+      - face_crop (BGR)
+      - bbox (x1, y1, x2, y2) or None if no face found
+
+    If detection fails or cascade isn't loaded, returns (frame_bgr, None).
+    """
     if face_cascade is None:
         return frame_bgr, None
 
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
     faces = face_cascade.detectMultiScale(
         gray,
         scaleFactor=1.1,
@@ -149,7 +160,10 @@ def detect_and_crop_face(frame_bgr: np.ndarray):
     if len(faces) == 0:
         return frame_bgr, None
 
+    # Pick the largest face
     x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+
+    # Optional: add a bit of padding around the face
     pad = int(0.15 * h)
     x1 = max(0, x - pad)
     y1 = max(0, y - pad)
@@ -161,26 +175,32 @@ def detect_and_crop_face(frame_bgr: np.ndarray):
 
 
 # --------------------------------------------------
-# Main loop using Picamera2
+# Main loop using Picamera2 + FPS counter
 # --------------------------------------------------
 def main():
-    # Initialize Pi camera through Picamera2
     picam2 = Picamera2()
 
-    # Simple 640x480 RGB config for speed
+    # Smaller resolution for speed
     config = picam2.create_preview_configuration(
-        main={"size": (640, 480), "format": "RGB888"}
+        main={"size": (320, 240), "format": "RGB888"}
     )
     picam2.configure(config)
     picam2.start()
 
+    # Warmup so exposure/brightness can settle
+    time.sleep(1.0)
+
     print("✅ Live Emotion Detector running (Pi Camera). Press 'q' to quit.")
+
+    frame_count = 0
+    last_pred_group = "Neutral"
+    fps = 0.0
+    last_time = time.time()
 
     try:
         while True:
-            # Grab frame as RGB
-            frame_rgb = picam2.capture_array()  # shape (H, W, 3), RGB
-            # Convert to BGR for OpenCV
+            # Grab frame as RGB from PiCam
+            frame_rgb = picam2.capture_array()  # (H, W, 3), RGB
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
             # Face detection + crop
@@ -190,33 +210,58 @@ def main():
                 x1, y1, x2, y2 = bbox
                 cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
-            # Preprocess + inference
-            input_tensor = preprocess_frame(face_bgr).to(device)
+            # FPS update
+            frame_count += 1
+            now = time.time()
+            dt = now - last_time
+            if dt > 0:
+                inst_fps = 1.0 / dt
+                fps = inst_fps if fps == 0.0 else (0.9 * fps + 0.1 * inst_fps)
+            last_time = now
 
-            with torch.no_grad():
-                logits = model(input_tensor)
-                probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
+            # Run inference only every 3rd frame
+            do_infer = (frame_count % 3 == 0)
 
-            group_scores = {}
-            for group_name, labels in GROUPS.items():
-                idxs = [label_to_idx[l] for l in labels if l in label_to_idx]
-                group_scores[group_name] = float(probs[idxs].sum()) if idxs else 0.0
+            if do_infer:
+                input_tensor = preprocess_frame(face_bgr).to(device)
 
-            pred_group = max(group_scores, key=group_scores.get)
+                with torch.no_grad():
+                    logits = model(input_tensor)
+                    probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
 
-            print(
-                f"[GROUP] Pos={group_scores['Positive']:.2f} | "
-                f"Neu={group_scores['Neutral']:.2f} | "
-                f"Neg={group_scores['Negative']:.2f} -> {pred_group}"
+                group_scores = {}
+                for group_name, labels in GROUPS.items():
+                    idxs = [label_to_idx[l] for l in labels if l in label_to_idx]
+                    group_scores[group_name] = float(probs[idxs].sum()) if idxs else 0.0
+
+                last_pred_group = max(group_scores, key=group_scores.get)
+
+                print(
+                    f"[GROUP] Pos={group_scores['Positive']:.2f} | "
+                    f"Neu={group_scores['Neutral']:.2f} | "
+                    f"Neg={group_scores['Negative']:.2f} -> {last_pred_group} "
+                    f"(FPS ~ {fps:.1f})"
+                )
+
+            # Draw last prediction + FPS on every frame
+            cv2.putText(
+                frame_bgr,
+                f"{last_pred_group}",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
             )
 
             cv2.putText(
                 frame_bgr,
-                f"{pred_group}",
-                (20, 40),
+                f"FPS: {fps:.1f}",
+                (20, 80),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                1.2,
-                (0, 255, 0),
+                0.7,
+                (0, 255, 255),
                 2,
                 cv2.LINE_AA,
             )
