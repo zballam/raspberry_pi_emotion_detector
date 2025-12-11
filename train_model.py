@@ -174,11 +174,10 @@ def make_dataloaders_single_csv(
     # Device-dependent loader config
     # ------------------------------
     if device.type == "cuda":
-        # Larger batch to keep 3090 busier, but still safe for Windows
-        batch_size = 300
-        num_workers = 4
-        persistent_workers = False
-        prefetch_factor = 2
+        batch_size = 256
+        num_workers = 8
+        persistent_workers = True
+        prefetch_factor = 4
     elif device.type == "mps":
         batch_size = 64
         num_workers = 4
@@ -333,10 +332,10 @@ def make_dataloaders_balanced_single_csv(
     # Device-dependent loader config
     # ------------------------------
     if device.type == "cuda":
-        batch_size = 300
-        num_workers = 4
-        persistent_workers = False
-        prefetch_factor = 2
+        batch_size = 256
+        num_workers = 8
+        persistent_workers = True
+        prefetch_factor = 4
     elif device.type == "mps":
         batch_size = 64
         num_workers = 4
