@@ -1,5 +1,3 @@
-# evaluate_model.py
-
 from pathlib import Path
 import torch
 import torch.nn as nn
@@ -23,9 +21,26 @@ device = (
     else torch.device("cpu")
 )
 
+
+def load_checkpoint_into_model(model, ckpt_path):
+    state = torch.load(ckpt_path, map_location=device)
+
+    # Handle different checkpoint formats
+    if isinstance(state, dict):
+        if "state_dict" in state:
+            state = state["state_dict"]
+        elif "model_state_dict" in state:
+            state = state["model_state_dict"]
+
+    model.load_state_dict(state)
+    return model
+
+
 def main():
     # Recreate the same split (same seed inside make_dataloaders_single_csv)
-    _, val_loader, num_classes = make_dataloaders_single_csv(
+    # NOTE: make_dataloaders_single_csv now returns extra stuff (e.g. class_weights),
+    # so we use *_
+    _, val_loader, num_classes, *_ = make_dataloaders_single_csv(
         MODEL_NAME,
         csv_path=CSV_PATH,
         label_column="coarse_label",
@@ -35,8 +50,7 @@ def main():
     # Build model and load weights
     model, _ = build_model(MODEL_NAME, num_classes)
     ckpt_path = Path("models") / f"emotion_{MODEL_NAME}_best.pt"
-    state = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(state)
+    model = load_checkpoint_into_model(model, ckpt_path)
     model.to(device)
     model.eval()
 

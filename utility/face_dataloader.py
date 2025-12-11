@@ -1,15 +1,3 @@
-# utility/face_dataloader.py
-
-from pathlib import Path
-from typing import Optional, Callable, Any, Dict
-
-import cv2
-import numpy as np
-import pandas as pd
-import torch
-from torch.utils.data import Dataset
-
-
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -32,6 +20,9 @@ class EmoticFaceDataset(Dataset):
         csv_path: path to labels CSV (labels_coarse.csv)
         label_column: which column to use as the class label
         root_dir: base directory for images. If None, uses csv_path.parent
+
+        NOTE: images are loaded as GRAYSCALE and then replicated to 3 channels,
+        so the network still sees 3-channel input but with no color information.
         """
         self.csv_path = Path(csv_path)
         self.df = pd.read_csv(self.csv_path)
@@ -97,17 +88,18 @@ class EmoticFaceDataset(Dataset):
         rel_path = row["filepath"]
         img_path = self._resolve_path(rel_path)
 
-        img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+        # Load as GRAYSCALE
+        img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
         if img is None:
             raise FileNotFoundError(f"Could not read image at {img_path}")
 
-        # BGR -> RGB
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-        # HWC -> CHW, float32 in [0,1]
+        # img: H x W, values 0–255 -> float32 [0,1]
         img = img.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))  # C,H,W
-        x = torch.from_numpy(img)
+
+        # Replicate grayscale into 3 channels so the net still sees 3-channel input
+        img = np.stack([img, img, img], axis=0)  # C,H,W
+
+        x = torch.from_numpy(img)  # shape [3, H, W]
 
         if self.transform is not None:
             x = self.transform(x)

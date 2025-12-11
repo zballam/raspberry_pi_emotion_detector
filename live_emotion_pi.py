@@ -74,12 +74,18 @@ transform = get_transforms(MODEL_NAME, is_train=False)
 def preprocess_frame(frame_bgr: np.ndarray) -> torch.Tensor:
     """
     Take a BGR OpenCV frame (ideally a face crop), return a 1x3xHxW tensor.
-    """
-    # BGR -> RGB
-    img_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-    # HWC float32 in [0,1]
-    img = img_rgb.astype("float32") / 255.0
+    We convert to GRAYSCALE and then replicate to 3 channels, to match
+    the training pipeline which also uses grayscale-3channel input.
+    """
+    # BGR -> GRAY
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+    # H,W float32 in [0,1]
+    gray = gray.astype("float32") / 255.0
+
+    # Replicate into 3 channels: H,W -> H,W,3
+    img = np.stack([gray, gray, gray], axis=2)
 
     # -> CHW tensor
     tensor = torch.from_numpy(img).permute(2, 0, 1)  # C,H,W

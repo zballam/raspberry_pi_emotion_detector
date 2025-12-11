@@ -112,7 +112,7 @@ def build_model(model_name: str, num_classes: int):
 
 # =====================================================
 # ONE-CSV dataloader (labels_coarse.csv)
-#  + balanced sampler (NO class-weighted loss)
+#  + stronger imbalance handling (sampler + loss)
 # =====================================================
 def make_dataloaders_single_csv(
     model_name: str,
@@ -120,7 +120,8 @@ def make_dataloaders_single_csv(
     label_column="coarse_label",
     batch_size=64,
     val_frac=0.2,
-    seed=42
+    seed=42,
+    imbalance_gamma: float = 1.5,
 ):
     """
     Random split from ONE CSV.
@@ -158,10 +159,15 @@ def make_dataloaders_single_csv(
 
     print("[make_dataloaders_single_csv] Class counts:", class_counts.tolist())
 
-    # Inverse-frequency weights
-    inv_freq = 1.0 / class_counts
+    # Inverse-frequency weights with a stronger exponent
+    # gamma > 1 makes minority classes relatively heavier
+    inv_freq = (1.0 / class_counts) ** imbalance_gamma
     inv_freq = inv_freq / inv_freq.mean()  # normalize around 1.0
-    print("[make_dataloaders_single_csv] Sampler weights (inv_freq):", inv_freq.tolist())
+
+    print(
+        f"[make_dataloaders_single_csv] Sampler weights (inv_freq, gamma={imbalance_gamma}):",
+        inv_freq.tolist(),
+    )
 
     # ------------------------------
     # Device-dependent loader config
@@ -252,7 +258,6 @@ def make_dataloaders_single_csv(
     class_weights = class_weights / class_weights.mean()
     print("[make_dataloaders_single_csv] Loss class_weights:", class_weights.tolist())
 
-    # Now we REALLY use class_weights (not None)
     return train_loader, val_loader, num_classes, class_weights
 
 
