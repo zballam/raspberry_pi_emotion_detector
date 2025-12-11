@@ -28,7 +28,7 @@ def plot_metric(histories, metric, title, ylabel):
     plt.show()
 
 def main():
-    model_names = ["tinycnn", "mobilenetv2", "efficientnet_lite0"]
+    model_names = ["tinycnn"] #, "mobilenetv2", "efficientnet_lite0"]
 
     raw_histories = {name: load_history(name) for name in model_names}
     # keep only those that loaded successfully
