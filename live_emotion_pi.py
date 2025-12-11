@@ -181,26 +181,32 @@ def detect_and_crop_face(frame_bgr: np.ndarray):
 # --------------------------------------------------
 def open_any_camera():
     """
-    Try several /dev/videoN devices and backends, return an opened VideoCapture
-    or None if all fail.
+    Try several /dev/videoN devices and backends.
+    Only accept a camera if we can actually read a frame.
     """
-    # Try a handful of indices; you have many /dev/video* nodes
     indices_to_try = [0, 1, 2, 3, 4, 5]
 
     for idx in indices_to_try:
-        # First try V4L2 explicitly
-        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
-        if cap.isOpened():
-            print(f"✅ Opened camera /dev/video{idx} with CAP_V4L2")
-            return cap
+        for backend, backend_name in [
+            (cv2.CAP_V4L2, "CAP_V4L2"),
+            (cv2.CAP_ANY, "default"),
+        ]:
+            cap = cv2.VideoCapture(idx, backend)
+            if not cap.isOpened():
+                cap.release()
+                continue
 
-        # Fallback: let OpenCV pick the backend
-        cap = cv2.VideoCapture(idx)
-        if cap.isOpened():
-            print(f"✅ Opened camera /dev/video{idx} with default backend")
-            return cap
+            # Try grabbing one frame as a test
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                h, w = frame.shape[:2]
+                print(f"✅ Opened /dev/video{idx} with {backend_name} ({w}x{h})")
+                return cap
 
-    print("❌ Could not open any camera from indices:", indices_to_try)
+            print(f"⚠️ /dev/video{idx} with {backend_name} opened but could not read a frame.")
+            cap.release()
+
+    print("❌ Could not open any camera that returns frames from indices:", indices_to_try)
     return None
 
 
