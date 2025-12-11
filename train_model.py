@@ -174,8 +174,8 @@ def make_dataloaders_single_csv(
     # Device-dependent loader config
     # ------------------------------
     if device.type == "cuda":
-        batch_size = 256
-        num_workers = 8
+        batch_size = 768
+        num_workers = 4
         persistent_workers = True
         prefetch_factor = 4
     elif device.type == "mps":
@@ -332,8 +332,8 @@ def make_dataloaders_balanced_single_csv(
     # Device-dependent loader config
     # ------------------------------
     if device.type == "cuda":
-        batch_size = 256
-        num_workers = 8
+        batch_size = 768
+        num_workers = 4
         persistent_workers = True
         prefetch_factor = 4
     elif device.type == "mps":

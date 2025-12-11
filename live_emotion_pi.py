@@ -1,5 +1,3 @@
-# live_emotion_pi.py
-
 import cv2
 import torch
 import numpy as np
@@ -14,7 +12,7 @@ from utility.face_dataloader import EmoticFaceDataset
 # --------------------------------------------------
 ROOT = Path(__file__).resolve().parent
 CSV_PATH = ROOT / "data" / "emotic_faces_128" / "labels_coarse.csv"
-MODEL_PATH = ROOT / "models" / "emotion_tinycnn_best.pt"
+MODEL_PATH = ROOT / "models" / "emotion_tinycnn_best.pt"  # make sure this is the WEIGHTED ckpt
 
 MODEL_NAME = "tinycnn"          # we’re using tinycnn for real-time
 LABEL_COLUMN = "coarse_label"   # same as training
@@ -50,12 +48,20 @@ idx_to_label = load_label_mapping()
 num_classes = len(idx_to_label)
 print("Num classes:", num_classes)
 
-# Make a stable list of labels ordered by index for nicer debug prints
+# Stable list in index order
 label_list = [idx_to_label[i] for i in range(num_classes)]
+label_to_idx = {name: idx for idx, name in idx_to_label.items()}
+
+# ---- NEW: coarse emotion groups for display ----
+GROUPS = {
+    "Positive": ["happy", "surprised"],
+    "Neutral": ["neutral", "confused"],
+    "Negative": ["angry", "sad"],
+}
 
 
 # --------------------------------------------------
-# Build model + load weights (reuses your pipeline)
+# Build model + load weights
 # --------------------------------------------------
 model, _ = build_model(MODEL_NAME, num_classes)
 state = torch.load(MODEL_PATH, map_location=device)
@@ -74,7 +80,6 @@ transform = get_transforms(MODEL_NAME, is_train=False)
 def preprocess_frame(frame_bgr: np.ndarray) -> torch.Tensor:
     """
     Take a BGR OpenCV frame (ideally a face crop), return a 1x3xHxW tensor.
-
     We convert to GRAYSCALE and then replicate to 3 channels, to match
     the training pipeline which also uses grayscale-3channel input.
     """
@@ -179,23 +184,32 @@ def main():
         # Preprocess (on the face crop if available, otherwise full frame)
         input_tensor = preprocess_frame(face_bgr).to(device)
 
-        # Inference + debugging prints
         with torch.no_grad():
             logits = model(input_tensor)
-            probs = torch.softmax(logits, dim=1)[0].cpu().numpy()  # shape [num_classes]
-            pred_idx = int(probs.argmax())
-            pred_label = idx_to_label[pred_idx]
+            probs = torch.softmax(logits, dim=1)[0].cpu().numpy()  # [num_classes]
 
-        # --- DEBUGGING: print probabilities for each class ---
-        prob_str = " | ".join(
-            f"{label_list[i]}: {probs[i]:.3f}" for i in range(num_classes)
+        # ---- NEW: map 6-class probs -> 3 coarse groups ----
+        group_scores = {}
+        for group_name, labels in GROUPS.items():
+            idxs = [label_to_idx[l] for l in labels if l in label_to_idx]
+            if idxs:
+                group_scores[group_name] = float(probs[idxs].sum())
+            else:
+                group_scores[group_name] = 0.0
+
+        pred_group = max(group_scores, key=group_scores.get)
+
+        # Optional short debug print (won't spam too badly)
+        print(
+            f"[GROUP] Pos={group_scores['Positive']:.2f} | "
+            f"Neu={group_scores['Neutral']:.2f} | "
+            f"Neg={group_scores['Negative']:.2f} -> {pred_group}"
         )
-        print(f"[DEBUG] {prob_str} -> pred = {pred_label}")
 
-        # Draw label on frame
+        # Draw coarse label on frame
         cv2.putText(
             frame,
-            f"{pred_label}",
+            f"{pred_group}",
             (20, 40),
             cv2.FONT_HERSHEY_SIMPLEX,
             1.2,
