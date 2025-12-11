@@ -174,10 +174,11 @@ def make_dataloaders_single_csv(
     # Device-dependent loader config
     # ------------------------------
     if device.type == "cuda":
-        batch_size = 512
-        num_workers = 12
-        persistent_workers = True
-        prefetch_factor = 4
+        # More conservative settings for Windows to avoid shared memory issues
+        batch_size = 128
+        num_workers = 4
+        persistent_workers = False
+        prefetch_factor = 2
     elif device.type == "mps":
         batch_size = 64
         num_workers = 4
@@ -330,10 +331,10 @@ def make_dataloaders_balanced_single_csv(
 
     # Device-dependent loader config
     if device.type == "cuda":
-        batch_size = 512
-        num_workers = 12
-        persistent_workers = True
-        prefetch_factor = 4
+        batch_size = 128
+        num_workers = 4
+        persistent_workers = False
+        prefetch_factor = 2
     elif device.type == "mps":
         batch_size = 64
         num_workers = 4
@@ -582,7 +583,6 @@ def train_model(
 
     if save_path:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), model.state_dict())
         torch.save(model.state_dict(), save_path)
         print(f"[{model_name}] Saved best model to {save_path}")
 
@@ -700,7 +700,6 @@ if __name__ == "__main__":
     CSV_PATH = "data/emotic_faces_128/labels_coarse.csv"
 
     model_names = ["tinycnn", "mobilenetv2", "efficientnet_lite0"]
-    regimes = ["weighted", "balanced"]
 
     # You can cap per-class size for balanced if you want faster training
     max_per_class_balanced = None  # e.g. 4000 if you want
