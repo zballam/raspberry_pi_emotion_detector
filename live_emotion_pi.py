@@ -45,7 +45,7 @@ print(f"Using device: {device}")
 dataset = EmoticFaceDataset(
     csv_path=str(CSV_PATH),
     root_dir=str(IMG_ROOT),
-    label_col="coarse_label",
+    label_column="coarse_label",
     transform=None,
 )
 
