@@ -10,8 +10,8 @@ from utility.model_loader import build_model, get_transforms
 # Paths & basic config
 # --------------------------------------------------
 ROOT = Path(__file__).resolve().parent
-MODEL_PATH = ROOT / "models" / "emotion_tinycnn_best.pt"  # make sure this file exists
-MODEL_NAME = "tinycnn"  # tinycnn for real-time on Pi
+MODEL_PATH = ROOT / "models" / "emotion_tinycnn_best.pt"  # weighted TinyCNN checkpoint
+MODEL_NAME = "tinycnn"  # using tinycnn for real-time on Pi
 
 # === Static labels: make sure order matches training ===
 label_list = [
@@ -92,16 +92,48 @@ def preprocess_frame(frame_bgr: np.ndarray) -> torch.Tensor:
 
 
 # --------------------------------------------------
-# Face detection / cropping
+# Face detection / cascade loading
 # --------------------------------------------------
+def _find_haar_cascade():
+    """
+    Try several common locations for the frontal face cascade
+    on Raspberry Pi / Debian OpenCV builds.
+    """
+    cascade_name = "haarcascade_frontalface_default.xml"
+    candidates = []
+
+    # Some builds have cv2.data, some don't
+    if hasattr(cv2, "data"):
+        try:
+            candidates.append(Path(cv2.data.haarcascades) / cascade_name)
+        except Exception:
+            pass
+
+    # Common Debian/RPi OpenCV locations
+    candidates.extend([
+        Path("/usr/share/opencv4/haarcascades") / cascade_name,
+        Path("/usr/share/opencv/haarcascades") / cascade_name,
+    ])
+
+    for p in candidates:
+        if p.is_file():
+            return str(p)
+
+    return None
+
+
 try:
-    FACE_CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    face_cascade = cv2.CascadeClassifier(FACE_CASCADE_PATH)
-    if face_cascade.empty():
-        print("⚠️ Could not load Haar cascade, will use full frame.")
+    cascade_path = _find_haar_cascade()
+    if cascade_path is None:
+        print("⚠️ Could not find Haar cascade file, will use full frame.")
         face_cascade = None
     else:
-        print("✅ Loaded face cascade from:", FACE_CASCADE_PATH)
+        face_cascade = cv2.CascadeClassifier(cascade_path)
+        if face_cascade.empty():
+            print(f"⚠️ Failed to load cascade from {cascade_path}, will use full frame.")
+            face_cascade = None
+        else:
+            print("✅ Loaded face cascade from:", cascade_path)
 except Exception as e:
     print("⚠️ Error loading face cascade:", e)
     face_cascade = None
@@ -145,13 +177,39 @@ def detect_and_crop_face(frame_bgr: np.ndarray):
 
 
 # --------------------------------------------------
+# Camera selection helper
+# --------------------------------------------------
+def open_any_camera():
+    """
+    Try several /dev/videoN devices and backends, return an opened VideoCapture
+    or None if all fail.
+    """
+    # Try a handful of indices; you have many /dev/video* nodes
+    indices_to_try = [0, 1, 2, 3, 4, 5]
+
+    for idx in indices_to_try:
+        # First try V4L2 explicitly
+        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+        if cap.isOpened():
+            print(f"✅ Opened camera /dev/video{idx} with CAP_V4L2")
+            return cap
+
+        # Fallback: let OpenCV pick the backend
+        cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            print(f"✅ Opened camera /dev/video{idx} with default backend")
+            return cap
+
+    print("❌ Could not open any camera from indices:", indices_to_try)
+    return None
+
+
+# --------------------------------------------------
 # Main webcam / Pi loop
 # --------------------------------------------------
 def main():
-    # 0 = default webcam OR Pi camera if exposed as /dev/video0
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("❌ Could not open camera (VideoCapture(0) failed).")
+    cap = open_any_camera()
+    if cap is None:
         return
 
     print("✅ Live Emotion Detector running. Press 'q' to quit.")
