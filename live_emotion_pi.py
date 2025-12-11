@@ -69,7 +69,7 @@ transform = get_transforms()
 # --------------------------------------------------
 def preprocess_frame(frame_bgr: np.ndarray) -> torch.Tensor:
     """
-    Take a BGR OpenCV frame (full frame), return a 1x3xHxW tensor.
+    Take a BGR OpenCV frame (face crop), return a 1x3xHxW tensor.
 
     Steps:
       - BGR -> GRAY
@@ -82,6 +82,85 @@ def preprocess_frame(frame_bgr: np.ndarray) -> torch.Tensor:
     img = np.stack([gray, gray, gray], axis=2).astype("float32")  # HWC
     tensor = transform(img)  # (C, H, W)
     return tensor.unsqueeze(0)  # (1, C, H, W)
+
+
+# --------------------------------------------------
+# Face detection / cascade loading
+# --------------------------------------------------
+def _find_haar_cascade():
+    cascade_name = "haarcascade_frontalface_default.xml"
+    candidates = []
+
+    if hasattr(cv2, "data"):
+        try:
+            candidates.append(Path(cv2.data.haarcascades) / cascade_name)
+        except Exception:
+            pass
+
+    candidates.extend(
+        [
+            Path("/usr/share/opencv4/haarcascades") / cascade_name,
+            Path("/usr/share/opencv/haarcascades") / cascade_name,
+        ]
+    )
+
+    for p in candidates:
+        if p.is_file():
+            return str(p)
+    return None
+
+
+try:
+    cascade_path = _find_haar_cascade()
+    if cascade_path is None:
+        print("⚠️ Could not find Haar cascade file. Will fallback to full frame.")
+        face_cascade = None
+    else:
+        face_cascade = cv2.CascadeClassifier(cascade_path)
+        if face_cascade.empty():
+            print(f"⚠️ Failed to load cascade from {cascade_path}. Fallback to full frame.")
+            face_cascade = None
+        else:
+            print("✅ Loaded face cascade from:", cascade_path)
+except Exception as e:
+    print("⚠️ Error loading face cascade:", e)
+    face_cascade = None
+
+
+def detect_and_crop_face(frame_bgr: np.ndarray):
+    """
+    Detect the largest face in the frame and return:
+      - face_crop (BGR)
+      - bbox (x1, y1, x2, y2) or None if no face found
+
+    If detection fails or cascade isn't loaded, returns (frame_bgr, None).
+    """
+    if face_cascade is None:
+        return frame_bgr, None
+
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(60, 60),
+    )
+
+    if len(faces) == 0:
+        return frame_bgr, None
+
+    # Pick the largest face
+    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+
+    pad = int(0.15 * h)
+    x1 = max(0, x - pad)
+    y1 = max(0, y - pad)
+    x2 = min(frame_bgr.shape[1], x + w + pad)
+    y2 = min(frame_bgr.shape[0], y + h + pad)
+
+    face_crop = frame_bgr[y1:y2, x1:x2]
+    return face_crop, (x1, y1, x2, y2)
 
 
 # --------------------------------------------------
@@ -100,7 +179,7 @@ def main():
     # Warmup so exposure/brightness can settle
     time.sleep(1.0)
 
-    print("✅ Live Emotion Detector running (Pi Camera, text-only).")
+    print("✅ Live Emotion Detector running (Pi Camera, text-only, face crop).")
     print("Press Ctrl+C in this terminal to stop.\n")
 
     frame_count = 0
@@ -116,6 +195,11 @@ def main():
             if frame_count == 0:
                 print("Frame min/max:", frame_bgr.min(), frame_bgr.max())
 
+            # Detect and crop face; fallback to full frame if no face
+            face_bgr, bbox = detect_and_crop_face(frame_bgr)
+            if face_bgr.size == 0:
+                face_bgr = frame_bgr
+
             # FPS update
             frame_count += 1
             now = time.time()
@@ -129,7 +213,7 @@ def main():
             if frame_count % 3 != 0:
                 continue
 
-            input_tensor = preprocess_frame(frame_bgr).to(device)
+            input_tensor = preprocess_frame(face_bgr).to(device)
 
             with torch.no_grad():
                 logits = model(input_tensor)
@@ -143,7 +227,6 @@ def main():
 
             pred_group = max(group_scores, key=group_scores.get)
 
-            # Nicely formatted one-line status
             print(
                 f"[GROUP] Pos={group_scores['Positive']:.2f} | "
                 f"Neu={group_scores['Neutral']:.2f} | "
