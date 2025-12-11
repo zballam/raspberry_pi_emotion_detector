@@ -1,228 +1,299 @@
+#!/usr/bin/env python3
+"""
+Live Emotion Detector for Raspberry Pi (Pi Camera, text-only console output).
+
+- Loads TinyCNN trained on EMOTIC faces.
+- Captures frames from the Pi camera using Picamera2.
+- Optionally uses a Haar cascade to detect faces; falls back to center crop.
+- Prints a compact, updating status line with the current prediction.
+- Periodically prints detailed debug info every N frames.
+"""
+
+import os
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
+
 from picamera2 import Picamera2
 
-from train_model import build_model, get_transforms
+from train_model import build_model
 from utility.face_dataloader import EmoticFaceDataset
 
+# =====================================================
+# Paths & device
+# =====================================================
 
-# --------------------------------------------------
-# Paths / constants
-# --------------------------------------------------
 ROOT = Path(__file__).resolve().parent
 CSV_PATH = ROOT / "data" / "emotic_faces_128" / "labels_coarse.csv"
-MODEL_PATH = ROOT / "models" / "emotion_tinycnn_best.pt"   # weighted ckpt
-MODEL_NAME = "tinycnn"
-LABEL_COLUMN = "coarse_label"
+IMG_ROOT = ROOT / "data" / "emotic_faces_128"
+MODEL_PATH = ROOT / "models" / "emotion_tinycnn_best.pt"
 
-
-# --------------------------------------------------
-# Device
-# --------------------------------------------------
 if torch.cuda.is_available():
     device = torch.device("cuda")
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = torch.device("mps")
 else:
     device = torch.device("cpu")
 
-print("Using device:", device)
+print(f"Using device: {device}")
 
+# =====================================================
+# Load dataset just to get labels / num classes
+# =====================================================
 
-# --------------------------------------------------
-# Label mapping (exactly as on Mac)
-# --------------------------------------------------
-def load_label_mapping():
-    base_ds = EmoticFaceDataset(
-        csv_path=CSV_PATH,
-        label_column=LABEL_COLUMN,
-        transform=None,
-        root_dir=None,
-    )
-    return base_ds.idx_to_label  # {idx: label_name}
+dataset = EmoticFaceDataset(
+    csv_path=str(CSV_PATH),
+    root_dir=str(IMG_ROOT),
+    label_col="coarse_label",
+    transform=None,
+)
 
+num_classes = dataset.num_classes
+# EmoticFaceDataset should have idx_to_label mapping; if it's a dict, sort by key
+idx_to_label = dataset.idx_to_label
+if isinstance(idx_to_label, dict):
+    labels = [idx_to_label[i] for i in range(num_classes)]
+else:
+    labels = list(idx_to_label)
 
-idx_to_label = load_label_mapping()
-num_classes = len(idx_to_label)
-print("Num classes:", num_classes)
+print(f"Num classes: {num_classes}")
+print(f"Labels: {labels}")
 
-label_list = [idx_to_label[i] for i in range(num_classes)]
-label_to_idx = {name: idx for idx, name in idx_to_label.items()}
-print("Labels:", label_list)
+# Grouping: map class indices into Positive / Neutral / Negative buckets
+POSITIVE_LABELS = {"happy", "surprised"}
+NEUTRAL_LABELS = {"neutral", "confused"}
+NEGATIVE_LABELS = {"angry", "sad"}
 
-GROUPS = {
-    "Positive": ["happy", "surprised"],
-    "Neutral":  ["neutral", "confused"],
-    "Negative": ["sad", "angry"],
-}
+positive_indices = [i for i, name in enumerate(labels) if name in POSITIVE_LABELS]
+neutral_indices = [i for i, name in enumerate(labels) if name in NEUTRAL_LABELS]
+negative_indices = [i for i, name in enumerate(labels) if name in NEGATIVE_LABELS]
 
+# =====================================================
+# Load model
+# =====================================================
 
-# --------------------------------------------------
-# Model + transforms (same as Mac script)
-# --------------------------------------------------
-model, _ = build_model(MODEL_NAME, num_classes)
-state = torch.load(MODEL_PATH, map_location=device)
-model.load_state_dict(state)
-model.to(device)
+def load_checkpoint_into_model(model, ckpt_path):
+    state = torch.load(ckpt_path, map_location=device)
+
+    # Handle different checkpoint formats
+    if isinstance(state, dict):
+        if "state_dict" in state:
+            state = state["state_dict"]
+        elif "model_state_dict" in state:
+            state = state["model_state_dict"]
+
+    model.load_state_dict(state)
+    return model
+
+model = build_model("tinycnn", num_classes=num_classes).to(device)
+model = load_checkpoint_into_model(model, str(MODEL_PATH))
 model.eval()
 print(f"Loaded model from {MODEL_PATH}")
 
-transform = get_transforms(MODEL_NAME, is_train=False)
+# =====================================================
+# Face cascade (optional)
+# =====================================================
 
+def load_face_cascade():
+    cascade = None
+    cascade_path = None
 
-def preprocess_frame(frame_bgr: np.ndarray) -> torch.Tensor:
+    try:
+        # Try cv2.data.haarcascades if available
+        if hasattr(cv2, "data") and hasattr(cv2.data, "haarcascades"):
+            candidate = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+            if os.path.exists(candidate):
+                cascade_path = candidate
+
+        # Try common Raspberry Pi / Debian OpenCV locations
+        if cascade_path is None:
+            candidates = [
+                "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
+                "/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml",
+            ]
+            for c in candidates:
+                if os.path.exists(c):
+                    cascade_path = c
+                    break
+
+        if cascade_path is not None:
+            cascade = cv2.CascadeClassifier(cascade_path)
+            if cascade is None or cascade.empty():
+                cascade = None
+                print(f"⚠️ Failed to load face cascade from: {cascade_path}")
+            else:
+                print(f"✅ Loaded face cascade from: {cascade_path}")
+        else:
+            print("⚠️ Could not find a Haar cascade file; using center crop only.")
+
+    except Exception as e:
+        print(f"⚠️ Error loading face cascade: {e}")
+        cascade = None
+
+    return cascade
+
+face_cascade = load_face_cascade()
+
+# =====================================================
+# Preprocessing helpers
+# =====================================================
+
+TARGET_SIZE = (128, 128)
+
+def crop_face_or_center(frame_rgb):
     """
-    Same preprocessing as your Mac webcam script:
-
-      - BGR -> GRAY
-      - [0, 1] float
-      - replicate to 3 channels
-      - CHW tensor
-      - pass through get_transforms(...)
+    frame_rgb: H x W x 3, uint8, RGB
+    Returns a cropped RGB image focusing on the face if possible,
+    otherwise a center crop.
     """
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    gray = gray.astype("float32") / 255.0  # H, W
+    h, w, _ = frame_rgb.shape
 
-    img = np.stack([gray, gray, gray], axis=2)  # H, W, 3
-    tensor = torch.from_numpy(img).permute(2, 0, 1)  # C, H, W
+    if face_cascade is not None:
+        # Convert to grayscale for detection
+        gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+        faces = face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.3,
+            minNeighbors=5,
+            minSize=(40, 40),
+        )
+        if len(faces) > 0:
+            # Choose the largest face
+            x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+            x1 = max(x, 0)
+            y1 = max(y, 0)
+            x2 = min(x + fw, w)
+            y2 = min(y + fh, h)
+            return frame_rgb[y1:y2, x1:x2, :]
 
-    tensor = transform(tensor)
-    return tensor.unsqueeze(0)  # (1, C, H, W)
+    # Fallback: center square crop
+    side = min(h, w)
+    y1 = (h - side) // 2
+    x1 = (w - side) // 2
+    return frame_rgb[y1:y1 + side, x1:x1 + side, :]
 
 
-# --------------------------------------------------
-# Face detection / cropping (same logic, no drawing)
-# --------------------------------------------------
-try:
-    FACE_CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    face_cascade = cv2.CascadeClassifier(FACE_CASCADE_PATH)
-    if face_cascade.empty():
-        print("⚠️ Could not load Haar cascade, will use full frame.")
-        face_cascade = None
-    else:
-        print("✅ Loaded face cascade from:", FACE_CASCADE_PATH)
-except Exception as e:
-    print("⚠️ Error loading face cascade:", e)
-    face_cascade = None
-
-
-def detect_and_crop_face(frame_bgr: np.ndarray):
+def preprocess(frame_rgb):
     """
-    Detect the largest face.
-    Returns:
-      - face_crop (BGR)
-      - bbox (x1, y1, x2, y2) or None
+    frame_rgb: H x W x 3, RGB uint8
+    Returns a torch tensor of shape [1, 3, 128, 128] on the correct device.
     """
-    if face_cascade is None:
-        return frame_bgr, None
+    # Optional debug on the very first frame:
+    # print("Frame min/max:", frame_rgb.min(), frame_rgb.max())
 
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(60, 60),
-    )
+    cropped = crop_face_or_center(frame_rgb)
+    resized = cv2.resize(cropped, TARGET_SIZE, interpolation=cv2.INTER_LINEAR)
 
-    if len(faces) == 0:
-        return frame_bgr, None
+    # Convert to float32 in [0,1]
+    img = resized.astype(np.float32) / 255.0
 
-    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+    # HWC -> CHW
+    img = np.transpose(img, (2, 0, 1))
 
-    pad = int(0.15 * h)
-    x1 = max(0, x - pad)
-    y1 = max(0, y - pad)
-    x2 = min(frame_bgr.shape[1], x + w + pad)
-    y2 = min(frame_bgr.shape[0], y + h + pad)
-
-    face_crop = frame_bgr[y1:y2, x1:x2]
-    return face_crop, (x1, y1, x2, y2)
+    # To tensor
+    x = torch.from_numpy(img).unsqueeze(0)  # [1, 3, 128, 128]
+    x = x.to(device)
+    return x
 
 
-# --------------------------------------------------
-# Main loop (PiCamera2, text-only)
-# --------------------------------------------------
+def group_probs(probs: np.ndarray):
+    """
+    probs: [num_classes] numpy array
+    Returns (pos, neu, neg, best_label_idx, best_label_name)
+    """
+    pos = float(probs[positive_indices].sum()) if positive_indices else 0.0
+    neu = float(probs[neutral_indices].sum()) if neutral_indices else 0.0
+    neg = float(probs[negative_indices].sum()) if negative_indices else 0.0
+
+    best_idx = int(np.argmax(probs))
+    best_label = labels[best_idx]
+
+    return pos, neu, neg, best_idx, best_label
+
+
+def group_label_from_triplet(pos, neu, neg):
+    """
+    Basic argmax over (pos, neu, neg) to decide Positive / Neutral / Negative.
+    """
+    group_names = ["Positive", "Neutral", "Negative"]
+    idx = int(np.argmax([pos, neu, neg]))
+    return group_names[idx]
+
+
+# =====================================================
+# Camera loop
+# =====================================================
+
 def main():
+    # Initialize camera
     picam2 = Picamera2()
-    config = picam2.create_preview_configuration(
+    config = picam2.create_video_configuration(
         main={"size": (320, 240), "format": "RGB888"}
     )
     picam2.configure(config)
     picam2.start()
-    time.sleep(1.0)  # warmup
 
     print("✅ Live Emotion Detector running (Pi Camera, text-only).")
     print("Press Ctrl+C in this terminal to stop.\n")
 
-    frame_count = 0
-    fps = 0.0
+    # Debug / status settings
+    DEBUG_EVERY = 120  # print detailed debug every N frames
+    frame_idx = 0
     last_time = time.time()
 
     try:
         while True:
-            frame_rgb = picam2.capture_array()
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            frame_rgb = picam2.capture_array()  # RGB888
+            frame_idx += 1
 
-            if frame_count == 0:
-                print("Frame min/max:", frame_bgr.min(), frame_bgr.max())
+            # Optional single sanity print at the very start
+            if frame_idx == 1:
+                print(
+                    f"Frame min/max: {frame_rgb.min()} {frame_rgb.max()}"
+                )
 
-            face_bgr, _ = detect_and_crop_face(frame_bgr)
-            if face_bgr is None or face_bgr.size == 0:
-                face_bgr = frame_bgr
+            # Preprocess
+            x = preprocess(frame_rgb)
 
-            # FPS
-            frame_count += 1
-            now = time.time()
+            # Inference
+            t0 = time.time()
+            with torch.no_grad():
+                logits = model(x)
+                probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+            t1 = time.time()
+
+            # Grouping
+            pos, neu, neg, best_idx, best_label = group_probs(probs)
+            group = group_label_from_triplet(pos, neu, neg)
+
+            # FPS estimation (smoothed a bit)
+            now = t1
             dt = now - last_time
-            if dt > 0:
-                inst_fps = 1.0 / dt
-                fps = inst_fps if fps == 0.0 else (0.9 * fps + 0.1 * inst_fps)
+            fps = 1.0 / dt if dt > 0 else 0.0
             last_time = now
 
-            # Throttle a bit
-            if frame_count % 3 != 0:
-                continue
-
-            input_tensor = preprocess_frame(face_bgr).to(device)
-
-            with torch.no_grad():
-                logits = model(input_tensor)
-                probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
-
-            best_idx = int(probs.argmax())
-            best_label = label_list[best_idx]
-
-            # Coarse group scores
-            group_scores = {}
-            for group_name, labels in GROUPS.items():
-                idxs = [label_to_idx[l] for l in labels if l in label_to_idx]
-                group_scores[group_name] = float(probs[idxs].sum()) if idxs else 0.0
-
-            pred_group = max(group_scores, key=group_scores.get)
-
-            # Raw debug (same style you liked)
+            # Compact status line: overwrites itself each frame
             print(
-                "[RAW] best={} ({})".format(
+                f"\r{group.upper():>8} "
+                f"| best={best_label:9} "
+                f"| Pos={pos:4.2f} Neu={neu:4.2f} Neg={neg:4.2f} "
+                f"| FPS={fps:5.1f}",
+                end="",
+                flush=True,
+            )
+
+            # Periodic detailed debug
+            if frame_idx % DEBUG_EVERY == 0:
+                print("\n[RAW] best={} ({})".format(
                     best_label,
                     ", ".join(
-                        f"{name}={probs[label_to_idx[name]]:.2f}"
-                        for name in label_list
+                        f"{labels[i]}={probs[i]:.2f}" for i in range(len(labels))
                     ),
+                ))
+                print(
+                    f"[GROUP] Pos={pos:.2f} | Neu={neu:.2f} | Neg={neg:.2f} -> {group}"
                 )
-            )
-            print(
-                "[GROUP] Pos={:.2f} | Neu={:.2f} | Neg={:.2f} -> {} (FPS ~ {:.1f})".format(
-                    group_scores["Positive"],
-                    group_scores["Neutral"],
-                    group_scores["Negative"],
-                    pred_group,
-                    fps,
-                )
-            )
 
     except KeyboardInterrupt:
         print("\nStopping live emotion detector...")
