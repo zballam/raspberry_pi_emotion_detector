@@ -66,11 +66,30 @@ transform = get_transforms()
 # Preprocessing
 # --------------------------------------------------
 def preprocess_frame(frame_bgr: np.ndarray) -> torch.Tensor:
+    """
+    Take a BGR OpenCV frame (ideally a face crop), return a 1x3xHxW tensor.
+
+    Here we:
+      - convert BGR -> GRAY
+      - normalize to [0, 1]
+      - replicate to 3 channels (H, W, 3) as float32
+      - feed a NumPy array into torchvision transforms (which will
+        handle ToTensor/Resize/Normalize)
+    """
+    # BGR -> GRAY
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+
+    # H, W, float32 in [0, 1]
     gray = gray.astype("float32") / 255.0
-    img = np.stack([gray, gray, gray], axis=2)
-    tensor = torch.from_numpy(img).permute(2, 0, 1)
-    tensor = transform(tensor)
+
+    # Replicate into 3 channels: H, W -> H, W, 3
+    img = np.stack([gray, gray, gray], axis=2).astype("float32")  # HWC
+
+    # Let torchvision transforms handle ToTensor + Resize + Normalize
+    # transform(img) -> tensor (C, H, W)
+    tensor = transform(img)
+
+    # Add batch dimension: (1, C, H, W)
     return tensor.unsqueeze(0)
 
 
