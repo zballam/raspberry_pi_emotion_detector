@@ -31,6 +31,7 @@ label_to_idx = {name: i for i, name in enumerate(label_list)}
 print("Num classes:", num_classes)
 print("Labels:", label_list)
 
+# Coarse groups (for explanation; mapping is done via best_label below)
 GROUPS = {
     "Positive": ["happy", "surprised"],
     "Neutral": ["neutral", "confused"],
@@ -164,7 +165,7 @@ def detect_and_crop_face(frame_bgr: np.ndarray):
 
 
 # --------------------------------------------------
-# Main loop using Picamera2 (text-only)
+# Main loop using Picamera2 (text-only, face crop)
 # --------------------------------------------------
 def main():
     picam2 = Picamera2()
@@ -197,7 +198,7 @@ def main():
 
             # Detect and crop face; fallback to full frame if no face
             face_bgr, bbox = detect_and_crop_face(frame_bgr)
-            if face_bgr.size == 0:
+            if face_bgr is None or face_bgr.size == 0:
                 face_bgr = frame_bgr
 
             # FPS update
@@ -209,7 +210,7 @@ def main():
                 fps = inst_fps if fps == 0.0 else (0.9 * fps + 0.1 * inst_fps)
             last_time = now
 
-            # Run inference every 3rd frame
+            # Run inference every 3rd frame for speed
             if frame_count % 3 != 0:
                 continue
 
@@ -219,20 +220,33 @@ def main():
                 logits = model(input_tensor)
                 probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
 
-            # Map to coarse groups
-            group_scores = {}
-            for group_name, labels in GROUPS.items():
-                idxs = [label_to_idx[l] for l in labels if l in label_to_idx]
-                group_scores[group_name] = float(probs[idxs].sum()) if idxs else 0.0
+            # ---- NEW: pick best single emotion, then map to coarse group ----
+            best_idx = int(probs.argmax())
+            best_label = label_list[best_idx]
 
-            pred_group = max(group_scores, key=group_scores.get)
+            if best_label in ("happy", "surprised"):
+                pred_group = "Positive"
+            elif best_label in ("neutral", "confused"):
+                pred_group = "Neutral"
+            else:  # "sad", "angry"
+                pred_group = "Negative"
 
+            # Debug: show raw per-emotion probabilities
             print(
-                f"[GROUP] Pos={group_scores['Positive']:.2f} | "
-                f"Neu={group_scores['Neutral']:.2f} | "
-                f"Neg={group_scores['Negative']:.2f} -> {pred_group} "
-                f"(FPS ~ {fps:.1f})"
+                "[RAW] best={} (happy={:.2f}, surprised={:.2f}, "
+                "neutral={:.2f}, confused={:.2f}, sad={:.2f}, angry={:.2f})".format(
+                    best_label,
+                    probs[label_to_idx["happy"]],
+                    probs[label_to_idx["surprised"]],
+                    probs[label_to_idx["neutral"]],
+                    probs[label_to_idx["confused"]],
+                    probs[label_to_idx["sad"]],
+                    probs[label_to_idx["angry"]],
+                )
             )
+
+            # Coarse group summary
+            print(f"[GROUP] -> {pred_group} (FPS ~ {fps:.1f})")
 
     except KeyboardInterrupt:
         print("\nStopping live emotion detector...")
