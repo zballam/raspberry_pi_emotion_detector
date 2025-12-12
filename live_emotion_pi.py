@@ -56,7 +56,21 @@ print(f"Using device: {device}")
 
 
 def load_model():
-    model = build_model(MODEL_NAME, NUM_CLASSES).to(device)
+    """
+    Handles both:
+      - build_model(name, num_classes) -> model
+      - build_model(name, num_classes) -> (model, something)
+    """
+    result = build_model(MODEL_NAME, NUM_CLASSES)
+
+    # If build_model returns (model, class_names) or similar:
+    if isinstance(result, tuple):
+        model = result[0]
+    else:
+        model = result
+
+    model = model.to(device)
+
     state = torch.load(MODEL_PATH, map_location=device)
 
     # Handle different checkpoint formats
