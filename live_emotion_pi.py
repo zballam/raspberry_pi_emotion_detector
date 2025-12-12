@@ -1,9 +1,10 @@
 # live_emotion_pi.py
 #
-# Lightweight, text-only live emotion detector for Raspberry Pi camera.
+# Live emotion detector for Raspberry Pi camera.
 # - Uses TinyCNN trained on EMOTIC face crops (128x128).
-# - Prints one summary line ~once per second (not every frame).
-# - If Haar cascade is unavailable, uses a centered crop of the frame.
+# - Prefers Picamera2 for capturing frames (best for Pi 5).
+# - Falls back to OpenCV VideoCapture(0) if Picamera2 is unavailable.
+# - Text-only: prints one summary line ~once per second.
 
 import time
 from pathlib import Path
@@ -18,16 +19,23 @@ from train_model import (
     IMAGENET_STD,
 )
 
+# Try to import Picamera2 (preferred on Raspberry Pi)
+try:
+    from picamera2 import Picamera2
+    HAVE_PICAMERA2 = True
+except ImportError:
+    Picamera2 = None
+    HAVE_PICAMERA2 = False
+
 # -----------------------------------------------------
 # Paths & constants
 # -----------------------------------------------------
 
 ROOT = Path(__file__).resolve().parent
-CSV_PATH = ROOT / "data" / "emotic_faces_128" / "labels_coarse.csv"
 MODEL_PATH = ROOT / "models" / "emotion_tinycnn_best.pt"
 MODEL_NAME = "tinycnn"
 
-# These MUST match the training order
+# These MUST match training label order
 LABELS = ["angry", "confused", "happy", "neutral", "sad", "surprised"]
 NUM_CLASSES = len(LABELS)
 
@@ -61,19 +69,15 @@ def load_model():
       - build_model(name, num_classes) -> model
       - build_model(name, num_classes) -> (model, something)
     """
-    result = build_model(MODEL_NAME, NUM_CLASSES)
-
-    # If build_model returns (model, class_names) or similar:
-    if isinstance(result, tuple):
-        model = result[0]
+    res = build_model(MODEL_NAME, NUM_CLASSES)
+    if isinstance(res, tuple):
+        model = res[0]
     else:
-        model = result
+        model = res
 
     model = model.to(device)
 
     state = torch.load(MODEL_PATH, map_location=device)
-
-    # Handle different checkpoint formats
     if isinstance(state, dict):
         if "state_dict" in state:
             state = state["state_dict"]
@@ -96,11 +100,11 @@ def load_model():
 def load_face_cascade():
     """
     Try to load a frontal face Haar cascade.
-    If unavailable on Pi, returns None and we fall back to full-frame crop.
+    If unavailable, returns None and we fall back to center crop.
     """
-    # 1) Try cv2.data.haarcascades if available
+    # Try cv2.data.haarcascades if available (not always on Pi)
     try:
-        haar_dir = cv2.data.haarcascades  # may not exist on Pi
+        haar_dir = cv2.data.haarcascades
         candidate = Path(haar_dir) / "haarcascade_frontalface_default.xml"
         if candidate.exists():
             cascade = cv2.CascadeClassifier(str(candidate))
@@ -110,7 +114,7 @@ def load_face_cascade():
     except Exception as e:
         print(f"⚠️ Could not use cv2.data.haarcascades: {e}")
 
-    # 2) Common Raspberry Pi OpenCV paths
+    # Common Raspberry Pi OpenCV paths
     candidates = [
         "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
         "/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml",
@@ -123,7 +127,7 @@ def load_face_cascade():
                 print(f"✅ Loaded face cascade from: {p}")
                 return cascade
 
-    print("⚠️ Face cascade not found; using full-frame crop.")
+    print("⚠️ Face cascade not found; using full-frame center crop.")
     return None
 
 
@@ -146,12 +150,12 @@ def choose_face_bbox(frame, face_cascade):
     return (x, y, x + w, y + h)
 
 
-def preprocess_face(frame, bbox, device):
+def preprocess_face(frame_bgr, bbox, device):
     """
     Crop face (or center of frame), resize to 128x128, normalize like training.
     Returns a 1x3x128x128 tensor on the given device.
     """
-    h, w, _ = frame.shape
+    h, w, _ = frame_bgr.shape
 
     if bbox is not None:
         x1, y1, x2, y2 = bbox
@@ -159,16 +163,16 @@ def preprocess_face(frame, bbox, device):
         y1 = max(0, y1)
         x2 = min(w, x2)
         y2 = min(h, y2)
-        crop = frame[y1:y2, x1:x2]
+        crop = frame_bgr[y1:y2, x1:x2]
     else:
-        # Center crop square if no face detected
+        # Center square crop if no face detected
         side = min(h, w)
         cy, cx = h // 2, w // 2
         y1 = max(0, cy - side // 2)
         y2 = y1 + side
         x1 = max(0, cx - side // 2)
         x2 = x1 + side
-        crop = frame[y1:y2, x1:x2]
+        crop = frame_bgr[y1:y2, x1:x2]
 
     # BGR -> RGB
     crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
@@ -214,80 +218,6 @@ def group_probs(probs):
 
 
 # -----------------------------------------------------
-# Camera open helper (Pi-friendly)
-# -----------------------------------------------------
-
-
-def _test_camera(cap, label: str):
-    """
-    Try to grab a single frame to verify camera is really working.
-    Returns (success: bool, frame or None).
-    """
-    if not cap or not cap.isOpened():
-        return False, None
-
-    # give pipeline a tiny moment to warm up
-    time.sleep(0.3)
-    ok, frame = cap.read()
-    if not ok or frame is None:
-        print(f"⚠️ {label}: opened but could not read a test frame.")
-        return False, None
-    print(f"✅ {label}: camera test frame OK. Resolution: {frame.shape[1]}x{frame.shape[0]}")
-    return True, frame
-
-
-def open_camera():
-    """
-    Try several ways to open the Pi camera:
-      1) Default VideoCapture(0)
-      2) VideoCapture(0, CAP_V4L2)
-      3) Low-res GStreamer v4l2 pipeline
-    Returns (cap, initial_frame) or (None, None) on failure.
-    """
-
-    # --- Attempt 1: default backend ---
-    print("🎥 Trying camera: cv2.VideoCapture(0) ...")
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-    ok, frame = _test_camera(cap, "Default backend")
-    if ok:
-        return cap, frame
-    cap.release()
-
-    # --- Attempt 2: V4L2 backend explicitly ---
-    print("🎥 Trying camera: cv2.VideoCapture(0, cv2.CAP_V4L2) ...")
-    try:
-        cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-        ok, frame = _test_camera(cap, "V4L2 backend")
-        if ok:
-            return cap, frame
-        cap.release()
-    except Exception as e:
-        print(f"⚠️ V4L2 backend threw an exception: {e}")
-
-    # --- Attempt 3: GStreamer v4l2 pipeline (low-res) ---
-    print("🎥 Trying camera: GStreamer v4l2 pipeline ...")
-    pipeline = (
-        "v4l2src device=/dev/video0 ! "
-        "image/jpeg, width=320, height=240, framerate=30/1 ! "
-        "jpegdec ! videoconvert ! appsink"
-    )
-    cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-    ok, frame = _test_camera(cap, "GStreamer v4l2 pipeline")
-    if ok:
-        return cap, frame
-    cap.release()
-
-    print("❌ Could not open camera with any backend.")
-    print("   - Make sure the camera is enabled and not in use by another process.")
-    print("   - Test with: libcamera-hello or libcamera-vid from the terminal.")
-    return None, None
-
-
-# -----------------------------------------------------
 # Main loop
 # -----------------------------------------------------
 
@@ -295,13 +225,6 @@ def open_camera():
 def main():
     model = load_model()
     face_cascade = load_face_cascade()
-
-    cap, first_frame = open_camera()
-    if cap is None:
-        return
-
-    print("✅ Live Emotion Detector running (Pi Camera, text-only).")
-    print("Press Ctrl+C in this terminal to stop.")
 
     start_time = time.time()
     last_print_time = start_time
@@ -311,40 +234,62 @@ def main():
     last_group = None
     last_group_scores = None
 
+    # Backend selection
+    using_picamera2 = False
+    picam2 = None
+    cap = None
+
     try:
-        # If we already got a frame during open, process it as frame 1
-        if first_frame is not None:
-            frame = first_frame
-            frame_count += 1
-            mn, mx = frame.min(), frame.max()
-            print(f"Frame min/max: {mn} {mx}")
+        if HAVE_PICAMERA2:
+            print("🎥 Using Picamera2 backend.")
+            picam2 = Picamera2()
+            # Small-ish resolution; RGB888 so we can convert to BGR
+            config = picam2.create_video_configuration(
+                main={"size": (640, 480), "format": "RGB888"}
+            )
+            picam2.configure(config)
+            picam2.start()
+            time.sleep(0.5)
+            using_picamera2 = True
+        else:
+            print("🎥 Picamera2 not available, falling back to OpenCV VideoCapture(0).")
+            cap = cv2.VideoCapture(0)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+            time.sleep(0.5)
+            if not cap.isOpened():
+                print("❌ Could not open camera with VideoCapture(0).")
+                return
 
-            bbox = choose_face_bbox(frame, face_cascade)
-            with torch.no_grad():
-                tensor = preprocess_face(frame, bbox, device)
-                logits = model(tensor)
-                probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
-
-            last_probs = probs
-            pos, neu, neg, group = group_probs(probs)
-            last_group = group
-            last_group_scores = (pos, neu, neg)
+        print("✅ Live Emotion Detector running (Pi Camera, text-only).")
+        print("Press Ctrl+C in this terminal to stop.")
 
         while True:
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                print("⚠️ Could not read frame from camera.")
-                break
+            # --- Get a frame ---
+            if using_picamera2:
+                # Picamera2 gives RGB; convert to BGR for OpenCV-style processing
+                frame_rgb = picam2.capture_array()
+                if frame_rgb is None:
+                    print("⚠️ Picamera2 returned no frame.")
+                    continue
+                frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            else:
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    print("⚠️ Could not read frame from camera.")
+                    break
 
             frame_count += 1
 
-            # Quick diagnostic only once
-            if frame_count == 1 and first_frame is None:
+            # Only print min/max once at the beginning as a sanity check
+            if frame_count == 1:
                 mn, mx = frame.min(), frame.max()
                 print(f"Frame min/max: {mn} {mx}")
 
+            # --- Face / crop selection ---
             bbox = choose_face_bbox(frame, face_cascade)
 
+            # --- Inference ---
             with torch.no_grad():
                 tensor = preprocess_face(frame, bbox, device)
                 logits = model(tensor)
@@ -355,7 +300,7 @@ def main():
             last_group = group
             last_group_scores = (pos, neu, neg)
 
-            # Print about once per second, not every frame
+            # --- Print once per second ---
             now = time.time()
             if now - last_print_time >= 1.0 and last_probs is not None:
                 elapsed = now - start_time
@@ -364,7 +309,6 @@ def main():
                 best_idx = int(np.argmax(last_probs))
                 best_label = LABELS[best_idx]
 
-                # Raw per-class line
                 class_str = ", ".join(
                     f"{lbl}={last_probs[i]:.2f}" for i, lbl in enumerate(LABELS)
                 )
@@ -382,7 +326,10 @@ def main():
         print("\nStopping live emotion detector...")
 
     finally:
-        cap.release()
+        if using_picamera2 and picam2 is not None:
+            picam2.stop()
+        if cap is not None:
+            cap.release()
 
 
 if __name__ == "__main__":
