@@ -214,6 +214,80 @@ def group_probs(probs):
 
 
 # -----------------------------------------------------
+# Camera open helper (Pi-friendly)
+# -----------------------------------------------------
+
+
+def _test_camera(cap, label: str):
+    """
+    Try to grab a single frame to verify camera is really working.
+    Returns (success: bool, frame or None).
+    """
+    if not cap or not cap.isOpened():
+        return False, None
+
+    # give pipeline a tiny moment to warm up
+    time.sleep(0.3)
+    ok, frame = cap.read()
+    if not ok or frame is None:
+        print(f"⚠️ {label}: opened but could not read a test frame.")
+        return False, None
+    print(f"✅ {label}: camera test frame OK. Resolution: {frame.shape[1]}x{frame.shape[0]}")
+    return True, frame
+
+
+def open_camera():
+    """
+    Try several ways to open the Pi camera:
+      1) Default VideoCapture(0)
+      2) VideoCapture(0, CAP_V4L2)
+      3) Low-res GStreamer v4l2 pipeline
+    Returns (cap, initial_frame) or (None, None) on failure.
+    """
+
+    # --- Attempt 1: default backend ---
+    print("🎥 Trying camera: cv2.VideoCapture(0) ...")
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+    ok, frame = _test_camera(cap, "Default backend")
+    if ok:
+        return cap, frame
+    cap.release()
+
+    # --- Attempt 2: V4L2 backend explicitly ---
+    print("🎥 Trying camera: cv2.VideoCapture(0, cv2.CAP_V4L2) ...")
+    try:
+        cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+        ok, frame = _test_camera(cap, "V4L2 backend")
+        if ok:
+            return cap, frame
+        cap.release()
+    except Exception as e:
+        print(f"⚠️ V4L2 backend threw an exception: {e}")
+
+    # --- Attempt 3: GStreamer v4l2 pipeline (low-res) ---
+    print("🎥 Trying camera: GStreamer v4l2 pipeline ...")
+    pipeline = (
+        "v4l2src device=/dev/video0 ! "
+        "image/jpeg, width=320, height=240, framerate=30/1 ! "
+        "jpegdec ! videoconvert ! appsink"
+    )
+    cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+    ok, frame = _test_camera(cap, "GStreamer v4l2 pipeline")
+    if ok:
+        return cap, frame
+    cap.release()
+
+    print("❌ Could not open camera with any backend.")
+    print("   - Make sure the camera is enabled and not in use by another process.")
+    print("   - Test with: libcamera-hello or libcamera-vid from the terminal.")
+    return None, None
+
+
+# -----------------------------------------------------
 # Main loop
 # -----------------------------------------------------
 
@@ -222,13 +296,8 @@ def main():
     model = load_model()
     face_cascade = load_face_cascade()
 
-    # Open Pi camera via OpenCV (libcamera backend)
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-
-    if not cap.isOpened():
-        print("❌ Could not open camera (index 0).")
+    cap, first_frame = open_camera()
+    if cap is None:
         return
 
     print("✅ Live Emotion Detector running (Pi Camera, text-only).")
@@ -243,16 +312,34 @@ def main():
     last_group_scores = None
 
     try:
+        # If we already got a frame during open, process it as frame 1
+        if first_frame is not None:
+            frame = first_frame
+            frame_count += 1
+            mn, mx = frame.min(), frame.max()
+            print(f"Frame min/max: {mn} {mx}")
+
+            bbox = choose_face_bbox(frame, face_cascade)
+            with torch.no_grad():
+                tensor = preprocess_face(frame, bbox, device)
+                logits = model(tensor)
+                probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+
+            last_probs = probs
+            pos, neu, neg, group = group_probs(probs)
+            last_group = group
+            last_group_scores = (pos, neu, neg)
+
         while True:
             ret, frame = cap.read()
-            if not ret:
+            if not ret or frame is None:
                 print("⚠️ Could not read frame from camera.")
                 break
 
             frame_count += 1
 
-            # Optional: quick diagnostic
-            if frame_count == 1:
+            # Quick diagnostic only once
+            if frame_count == 1 and first_frame is None:
                 mn, mx = frame.min(), frame.max()
                 print(f"Frame min/max: {mn} {mx}")
 
@@ -263,7 +350,6 @@ def main():
                 logits = model(tensor)
                 probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
 
-            # Store last for printing
             last_probs = probs
             pos, neu, neg, group = group_probs(probs)
             last_group = group
