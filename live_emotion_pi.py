@@ -28,7 +28,7 @@ except ImportError:
     HAVE_PICAMERA2 = False
 
 # -----------------------------------------------------
-# Paths & constants
+# Config / constants
 # -----------------------------------------------------
 
 ROOT = Path(__file__).resolve().parent
@@ -43,7 +43,8 @@ POSITIVE_LABELS = {"happy", "surprised"}
 NEGATIVE_LABELS = {"angry", "sad"}
 NEUTRAL_LABELS = {"confused", "neutral"}
 
-LABEL_TO_IDX = {lbl: i for i, lbl in enumerate(LABELS)}
+# If True, also print full probability vector each second
+VERBOSE = False
 
 # -----------------------------------------------------
 # Device
@@ -194,27 +195,30 @@ def preprocess_face(frame_bgr, bbox, device):
 
 
 # -----------------------------------------------------
-# Grouping helper
+# Group helper (simpler & less confusing)
 # -----------------------------------------------------
 
 
-def group_probs(probs):
+def best_label_and_group(probs):
     """
-    probs: 1D numpy array over LABELS (length 6).
-    Returns (pos, neu, neg, best_group_label)
-    """
-    pos = sum(probs[LABEL_TO_IDX[lbl]] for lbl in POSITIVE_LABELS)
-    neg = sum(probs[LABEL_TO_IDX[lbl]] for lbl in NEGATIVE_LABELS)
-    neu = sum(probs[LABEL_TO_IDX[lbl]] for lbl in NEUTRAL_LABELS)
+    probs: 1D numpy array over LABELS.
 
-    if pos >= neu and pos >= neg:
+    Returns:
+        best_label (str), best_conf (float), group (str)
+    where group is derived from the BEST label, not the sum.
+    """
+    best_idx = int(np.argmax(probs))
+    best_label = LABELS[best_idx]
+    best_conf = float(probs[best_idx])
+
+    if best_label in POSITIVE_LABELS:
         group = "Positive"
-    elif neg >= pos and neg >= neu:
+    elif best_label in NEGATIVE_LABELS:
         group = "Negative"
     else:
         group = "Neutral"
 
-    return float(pos), float(neu), float(neg), group
+    return best_label, best_conf, group
 
 
 # -----------------------------------------------------
@@ -231,8 +235,6 @@ def main():
     frame_count = 0
 
     last_probs = None
-    last_group = None
-    last_group_scores = None
 
     # Backend selection
     using_picamera2 = False
@@ -296,9 +298,6 @@ def main():
                 probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
 
             last_probs = probs
-            pos, neu, neg, group = group_probs(probs)
-            last_group = group
-            last_group_scores = (pos, neu, neg)
 
             # --- Print once per second ---
             now = time.time()
@@ -306,19 +305,27 @@ def main():
                 elapsed = now - start_time
                 fps = frame_count / elapsed if elapsed > 0 else 0.0
 
-                best_idx = int(np.argmax(last_probs))
-                best_label = LABELS[best_idx]
+                best_label, best_conf, group = best_label_and_group(last_probs)
 
-                class_str = ", ".join(
-                    f"{lbl}={last_probs[i]:.2f}" for i, lbl in enumerate(LABELS)
-                )
-                print(f"[RAW] best={best_label} ({class_str})")
+                # If model isn't confident, surface that explicitly
+                if best_conf < 0.40:
+                    group_display = "Uncertain"
+                else:
+                    group_display = group
 
-                pos, neu, neg = last_group_scores
+                # Clean single-line summary
                 print(
-                    f"[GROUP] Pos={pos:.2f} | Neu={neu:.2f} | Neg={neg:.2f} "
-                    f"-> {last_group} (FPS ~ {fps:.1f})"
+                    f"[EMOTION] {best_label.upper():9s} | "
+                    f"Group={group_display:9s} | "
+                    f"Conf={best_conf:.2f} | FPS~{fps:.1f}"
                 )
+
+                # Optional: full class probabilities (toggle at top)
+                if VERBOSE:
+                    class_str = " ".join(
+                        f"{lbl}={last_probs[i]:.2f}" for i, lbl in enumerate(LABELS)
+                    )
+                    print(f"          probs: {class_str}")
 
                 last_print_time = now
 
