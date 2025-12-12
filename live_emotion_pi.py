@@ -32,6 +32,8 @@ except ImportError:
 # -----------------------------------------------------
 
 ROOT = Path(__file__).resolve().parent
+
+# 🔴 Make sure this is the SAME .pt file you use on your Mac inference script.
 MODEL_PATH = ROOT / "models" / "emotion_tinycnn_best.pt"
 MODEL_NAME = "tinycnn"
 
@@ -43,7 +45,7 @@ POSITIVE_LABELS = {"happy", "surprised"}
 NEGATIVE_LABELS = {"angry", "sad"}
 NEUTRAL_LABELS = {"confused", "neutral"}
 
-# If True, also print full probability vector each second
+# If True, also print full probability vector each second (for debugging)
 VERBOSE = False
 
 # -----------------------------------------------------
@@ -195,30 +197,41 @@ def preprocess_face(frame_bgr, bbox, device):
 
 
 # -----------------------------------------------------
-# Group helper (simpler & less confusing)
+# Group helper (Mac-style grouping)
 # -----------------------------------------------------
 
 
-def best_label_and_group(probs):
+def group_probs(probs):
     """
-    probs: 1D numpy array over LABELS.
+    probs: 1D numpy array over LABELS (length 6).
 
     Returns:
-        best_label (str), best_conf (float), group (str)
-    where group is derived from the BEST label, not the sum.
+        pos, neu, neg, group
+      - pos/neu/neg are summed probabilities over their member labels
+      - group is the argmax of (pos, neu, neg)
+    This matches the 'macbook inference' style grouping.
     """
-    best_idx = int(np.argmax(probs))
-    best_label = LABELS[best_idx]
-    best_conf = float(probs[best_idx])
+    pos = 0.0
+    neu = 0.0
+    neg = 0.0
 
-    if best_label in POSITIVE_LABELS:
+    for i, lbl in enumerate(LABELS):
+        p = float(probs[i])
+        if lbl in POSITIVE_LABELS:
+            pos += p
+        elif lbl in NEGATIVE_LABELS:
+            neg += p
+        elif lbl in NEUTRAL_LABELS:
+            neu += p
+
+    if pos >= neu and pos >= neg:
         group = "Positive"
-    elif best_label in NEGATIVE_LABELS:
+    elif neg >= pos and neg >= neu:
         group = "Negative"
     else:
         group = "Neutral"
 
-    return best_label, best_conf, group
+    return pos, neu, neg, group
 
 
 # -----------------------------------------------------
@@ -305,19 +318,12 @@ def main():
                 elapsed = now - start_time
                 fps = frame_count / elapsed if elapsed > 0 else 0.0
 
-                best_label, best_conf, group = best_label_and_group(last_probs)
+                pos, neu, neg, group = group_probs(last_probs)
 
-                # If model isn't confident, surface that explicitly
-                if best_conf < 0.40:
-                    group_display = "Uncertain"
-                else:
-                    group_display = group
-
-                # Clean single-line summary
+                # Clean single-line summary: ONLY group + three group scores
                 print(
-                    f"[EMOTION] {best_label.upper():9s} | "
-                    f"Group={group_display:9s} | "
-                    f"Conf={best_conf:.2f} | FPS~{fps:.1f}"
+                    f"[GROUP] {group:8s} | "
+                    f"Pos={pos:.2f} | Neu={neu:.2f} | Neg={neg:.2f} | FPS~{fps:.1f}"
                 )
 
                 # Optional: full class probabilities (toggle at top)
